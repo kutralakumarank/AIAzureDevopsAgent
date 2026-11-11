@@ -1,0 +1,11 @@
+langchain
+langchain_community
+langchain_core
+langchain_groq
+faiss-cpu
+streamlit
+langchain_huggingface
+httpx>=0.28.1
+pydantic>=2.13.4
+python-dotenv>=1.0.0
+langchain-text-splitters>=1.0.0
