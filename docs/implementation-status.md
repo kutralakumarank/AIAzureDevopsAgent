@@ -86,6 +86,23 @@ its tests have been removed.
 Verification: all 30 active tests pass, including Streamlit credential submission
 and rejection of an empty form even when Azure environment credentials exist.
 
+## Azure connection HTTP 400 fix
+
+Identity validation now uses the Location API's preview version (`7.1-preview.1`
+with the default configuration), matching Microsoft's SDK. General REST calls still
+use the configured stable version. Explicit endpoint versions are preserved instead
+of being overwritten by the general request wrapper. API version configuration is
+normalized and validated before connecting.
+
+Errors identify identity validation versus project discovery and classify known
+version-related HTTP 400 responses without exposing remote messages or credentials.
+Three regression checks cover preview/stable separation, alternate configured
+versions and safe error reporting. Live authentication still requires a retry
+against the user's organization.
+
+Verification after the fix: all 33 tests pass in an isolated environment; Python
+compilation and the dependency lock check also pass. No live PAT was used.
+
 ## Follow-up cleanup
 
 Removed debug prints, unused imports, dead session state, redundant error handling

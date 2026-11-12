@@ -162,6 +162,22 @@ are not a remote uniqueness constraint. Use a shared distributed publication loc
 before scaling across instances. For exceptionally large corpora, replace per-query
 FAISS reconstruction with a scoped persistent search service through this same adapter.
 
+## Connection troubleshooting
+
+The identity check uses `/_apis/connectionData` with the endpoint's preview API
+version (for example `7.1-preview.1`), matching Microsoft's
+[LocationClient](https://github.com/microsoft/azure-devops-python-api/blob/dev/azure-devops/azure/devops/v7_1/location/location_client.py).
+Project discovery continues to use the configured stable version, normally `7.1`.
+Using stable `7.1` for the preview identity endpoint can result in HTTP 400 despite
+a valid PAT. Restart Streamlit after updating the code and reconnect through the form.
+
+Connection errors identify whether identity validation or project discovery failed.
+Known API-version errors are classified without showing remote response bodies or
+credentials. For a remaining generic HTTP 400, check that the supplied URL is the
+organization root (`https://dev.azure.com/organization`) and that any optional
+AZURE_DEVOPS_API_VERSION setting is a supported version. Authentication and
+permission failures remain distinct HTTP 401/403 errors.
+
 ## API references
 
 Connector request shapes follow Microsoft's [Suite Test Case Add](https://learn.microsoft.com/en-us/rest/api/azure/devops/testplan/suite-test-case/add?view=azure-devops-rest-7.1)

@@ -50,6 +50,52 @@ def draft():
 
 
 class ConnectorTests(unittest.TestCase):
+    def test_connection_uses_preview_version_and_projects_keep_stable_version(self):
+        requests = []
+        def handler(request):
+            requests.append(request)
+            if request.url.path.endswith('/connectionData'):
+                if request.url.params.get('api-version') != '7.1-preview.1':
+                    return httpx.Response(400, json={'typeKey': 'VssInvalidPreviewVersionException', 'message': 'Preview required'})
+                return httpx.Response(200, json={'authenticatedUser': {'id': 'user'}})
+            self.assertEqual(request.url.params['api-version'], '7.1')
+            return httpx.Response(200, json={'value': []})
+        api = AzureDevOps('https://dev.azure.com/example/', SecretStr('secret'), transport=httpx.MockTransport(handler))
+        try:
+            self.assertEqual(api.validate()['id'], 'user')
+            self.assertEqual(api.projects(), [])
+            self.assertEqual(len(requests), 2)
+            self.assertEqual(requests[0].url.path, '/example/_apis/connectionData')
+        finally:
+            api.close()
+
+    def test_connection_preview_tracks_configured_version(self):
+        def handler(request):
+            self.assertEqual(request.url.params['api-version'], '7.0-preview.1')
+            return httpx.Response(200, json={'authenticatedUser': {'id': 'user'}})
+        api = AzureDevOps('https://dev.azure.com/example', SecretStr('secret'), ' 7.0 ', httpx.MockTransport(handler))
+        try:
+            self.assertEqual(api.validate()['id'], 'user')
+        finally:
+            api.close()
+
+    def test_400_reports_stage_and_known_code_without_echoing_remote_message(self):
+        def handler(request):
+            return httpx.Response(400, json={'typeKey': 'VssInvalidPreviewVersionException', 'message': 'PAT-SECRET'})
+        api = AzureDevOps('https://dev.azure.com/example', SecretStr('PAT-SECRET'), transport=httpx.MockTransport(handler))
+        try:
+            with self.assertRaises(IntegrationError) as identity_error:
+                api.validate()
+            self.assertIn('identity validation', str(identity_error.exception))
+            self.assertIn('preview API version', str(identity_error.exception))
+            self.assertNotIn('PAT-SECRET', str(identity_error.exception))
+            with self.assertRaises(IntegrationError) as project_error:
+                api.projects()
+            self.assertIn('project discovery', str(project_error.exception))
+            self.assertNotIn('PAT-SECRET', str(project_error.exception))
+        finally:
+            api.close()
+
     def test_auth_pagination_and_secrets(self):
         requests = []
         def handler(request):

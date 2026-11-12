@@ -1,4 +1,5 @@
 """Azure DevOps REST 7.1 connector; PAT stays inside ServiceHTTP."""
+import re
 from urllib.parse import quote, urlsplit
 
 from pydantic import SecretStr
@@ -16,6 +17,9 @@ def wiql_literal(value):
 
 class AzureDevOps:
     def __init__(self, organization_url, pat: SecretStr, api_version='7.1', transport=None):
+        api_version = api_version.strip() or '7.1'
+        if not re.fullmatch(r'\d+\.\d+(?:-preview(?:\.\d+)?)?', api_version):
+            raise ValueError('AZURE_DEVOPS_API_VERSION must be a version such as 7.1')
         url = urlsplit(organization_url)
         if not ((url.hostname == 'dev.azure.com' and len(url.path.strip('/').split('/')) == 1 and url.path.strip('/'))
                 or (url.hostname and url.hostname.endswith('.visualstudio.com') and not url.path.strip('/'))):
@@ -37,7 +41,7 @@ class AzureDevOps:
 
     def request(self, method, path, **kwargs):
         params = dict(kwargs.pop('params', {}))
-        params['api-version'] = self.version
+        params.setdefault('api-version', self.version)
         return self.http.request(method, path, params=params, **kwargs)
 
     def values(self, path, **params):
@@ -54,13 +58,22 @@ class AzureDevOps:
             params['continuationToken'] = token
 
     def validate(self):
-        body, _ = self.request('GET', '/_apis/connectionData')
+        # Location/connectionData is preview even when Core/Projects is stable.
+        # Match Microsoft's LocationClient instead of applying the stable default.
+        version = self.version.split('-')[0] + '-preview.1'
+        try:
+            body, _ = self.request('GET', '/_apis/connectionData', params={'api-version': version})
+        except IntegrationError as error:
+            raise IntegrationError(f'Azure DevOps identity validation failed: {error}') from None
         if not body.get('authenticatedUser', {}).get('id'):
             raise IntegrationError('No authenticated Azure DevOps identity')
         return body['authenticatedUser']
 
     def projects(self):
-        return self.values('/_apis/projects', **{'$top': 100})
+        try:
+            return self.values('/_apis/projects', **{'$top': 100})
+        except IntegrationError as error:
+            raise IntegrationError(f'Azure DevOps project discovery failed: {error}') from None
 
     def authorize_project(self, project):
         body, _ = self.request('GET', f'/_apis/projects/{segment(project)}')

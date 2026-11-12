@@ -41,6 +41,20 @@ class ServiceHTTP:
             raise IntegrationError('Service connection failed; check network and service URL') from None
         if response.status_code in (401, 403):
             raise IntegrationError('Authentication or permission denied; check token scopes and project access')
+        if response.status_code == 400:
+            # Classify only known codes; remote messages can echo credentials/data.
+            try:
+                body = response.json()
+            except ValueError:
+                body = {}
+            code = body.get('typeKey') if isinstance(body, dict) else None
+            if not isinstance(code, str):
+                code = None
+            if code == 'VssInvalidPreviewVersionException':
+                raise IntegrationError('Service request failed (HTTP 400): this endpoint requires a preview API version')
+            if code in {'VssVersionNotSupportedException', 'VssUnsupportedRequestVersionException'}:
+                raise IntegrationError('Service request failed (HTTP 400): the configured API version is not supported')
+            raise IntegrationError('Service request failed (HTTP 400): the service rejected the request format; check the organization URL and API version')
         if not response.is_success:
             raise IntegrationError(f'Service request failed (HTTP {response.status_code}); retry or check permissions')
         try:
