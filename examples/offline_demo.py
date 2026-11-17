@@ -32,7 +32,7 @@ def run(output):
     item = {'id': 123, 'rev': 1, 'fields': {'System.TeamProject': 'Demo', 'System.Title': 'Create customer',
             'System.Description': 'A user creates a customer with a name.',
             'Microsoft.VSTS.Common.AcceptanceCriteria': '<li>Name is required</li><li>Valid customer is saved</li>'}}
-    remote_cases = []
+    remote_cases, suite_cases = [], set()
     def azure_response(request):
         path = request.url.path
         if path.endswith('/connectionData'):
@@ -56,7 +56,11 @@ def run(output):
             remote_cases.append(case)
             body = {'id': case['id']}
         elif path.endswith('/TestCase'):
-            body = []
+            if request.method == 'GET':
+                body = {'value': [{'workItem': {'id': case_id}} for case_id in suite_cases]}
+            else:
+                suite_cases.update(item['workItem']['id'] for item in json.loads(request.content))
+                body = []
         else:
             raise AssertionError('Unexpected demo route: ' + path)
         return httpx.Response(200, json=body)

@@ -14,7 +14,11 @@ class GroqLLM:
                 st.error("Please Enter the Groq API KEY")
                 return None
 
-            llm=ChatGroq(api_key=groq_api_key or os.environ.get('GROQ_API_KEY'),model=selected_groq_model,reasoning_format="hidden")
+            options = {}
+            # GPT-OSS does not accept reasoning_format; Qwen reasoning models do.
+            if selected_groq_model.startswith('qwen/'):
+                options['reasoning_format'] = 'hidden'
+            llm=ChatGroq(api_key=groq_api_key or os.environ.get('GROQ_API_KEY'),model=selected_groq_model,**options)
 
         except Exception:
             raise ValueError('Could not initialize the configured Groq model') from None

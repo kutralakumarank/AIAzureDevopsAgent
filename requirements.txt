@@ -2,9 +2,13 @@ langchain
 langchain_community
 langchain_core
 langchain_groq
+langchain-ollama>=1.1.0
 faiss-cpu
+numpy>=1.26
 streamlit
 langchain_huggingface
+groq>=0.37.1
+huggingface-hub>=1.22.0
 httpx>=0.28.1
 pydantic>=2.13.4
 python-dotenv>=1.0.0

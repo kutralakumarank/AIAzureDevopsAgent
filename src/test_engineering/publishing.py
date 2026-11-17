@@ -19,6 +19,40 @@ def steps_xml(steps):
     return tostring(root, encoding='unicode')
 
 
+def approve_review(store, workflow_id, revision, digest, edited_draft, *, explicit=False):
+    """Save displayed edits and approve exactly the revision the user reviewed."""
+    if not explicit:
+        raise PermissionError('Explicit approval is required')
+    workflow = store.load(workflow_id)
+    if workflow['revision'] != revision or workflow['digest'] != digest:
+        raise ValueError('Draft changed since it was displayed; reload and review it again')
+    validated = validate_draft(edited_draft, workflow['story'], workflow['context']).model_dump()
+    if validated != workflow['draft']:
+        store.save(workflow['story'], workflow['context'], validated, workflow_id, expected_revision=revision)
+        workflow = store.load(workflow_id)
+        if workflow['revision'] != revision + 1 or workflow['draft'] != validated:
+            raise ValueError('Draft changed while saving; reload and review it again')
+    store.approve(workflow_id, workflow['revision'], workflow['digest'], explicit=True)
+    approved = store.load(workflow_id)
+    if approved['revision'] != workflow['revision'] or approved['digest'] != workflow['digest'] or not approved['approved']:
+        raise ValueError('Draft changed during approval; reload and review it again')
+    return approved
+
+
+def approve_and_publish(publisher, workflow_id, revision, digest, edited_draft, plan_id, suite_id, *, explicit=False):
+    """A single explicit action approves the displayed revision and publishes it."""
+    if not explicit:
+        raise PermissionError('Explicit approval and publish confirmation is required')
+    ids = [str(plan_id), str(suite_id)]
+    if any(not value.isascii() or not value.isdigit() or len(value) > 10 for value in ids):
+        raise ValueError('Enter valid numeric Test Plan and Test Suite IDs')
+    plan_id, suite_id = map(int, ids)
+    if not (1 <= plan_id <= 2147483647 and 1 <= suite_id <= 2147483647):
+        raise ValueError('Test Plan and Test Suite IDs must be between 1 and 2147483647')
+    workflow = approve_review(publisher.store, workflow_id, revision, digest, edited_draft, explicit=True)
+    return publisher.publish(workflow_id, plan_id, suite_id, explicit=True, expected_digest=workflow['digest'])
+
+
 class Publisher:
     def __init__(self, azure, store, project_id):
         if azure.organization_id != store.scope.organization_id or str(project_id) != store.scope.project_id:
@@ -52,6 +86,10 @@ class Publisher:
                                  'ON w.id=r.workflow AND w.current_revision=r.revision WHERE w.id=?', (workflow_id,)).fetchone()
             if not current or current[0] != expected_digest or not current[1]:
                 raise PermissionError('Draft changed before publishing; review and approve the latest revision')
+            suite_path = f'/{segment(self.project)}/_apis/testplan/Plans/{int(plan_id)}/Suites/{int(suite_id)}/TestCase'
+            existing_cases = self.azure.values(suite_path)
+            suite_ids = {str((item.get('workItem') or {}).get('id')) for item in existing_cases
+                         if (item.get('workItem') or {}).get('id') is not None}
             for case in draft.test_cases:
                 fingerprint = sha256(json.dumps([self.store.scope.key, case.model_dump()], sort_keys=True).encode()).hexdigest()
                 tag = 'ai-test-' + fingerprint
@@ -85,9 +123,9 @@ class Publisher:
                     created, _ = self.azure.request('POST', f'/{segment(self.project)}/_apis/wit/workitems/$Test%20Case',
                                                    json=patch, headers={'Content-Type': 'application/json-patch+json'})
                     case_id = created['id']
-                # Adding an existing case to a suite is idempotent at Azure's membership level.
-                self.azure.request('POST', f'/{segment(self.project)}/_apis/testplan/Plans/{int(plan_id)}/Suites/{int(suite_id)}/TestCase',
-                                   json=[{'workItem': {'id': int(case_id)}}])
+                if str(case_id) not in suite_ids:
+                    self.azure.request('POST', suite_path, json=[{'workItem': {'id': int(case_id)}}])
+                    suite_ids.add(str(case_id))
                 db.execute('INSERT OR REPLACE INTO publications(fingerprint,case_id,status) VALUES (?,?,?)',
                            (fingerprint, case_id, 'published'))
                 results.append({'case_id': case_id, 'status': 'published', 'title': case.title})

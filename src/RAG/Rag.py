@@ -14,7 +14,6 @@ class Rag:
 
     def create_embeddings(self):
         if self.embeddings is None:
-            from langchain_huggingface import HuggingFaceEndpointEmbeddings
-
-            self.embeddings = HuggingFaceEndpointEmbeddings(model='google/embeddinggemma-300m')
+            from langchain_google_genai import GoogleGenerativeAIEmbeddings
+            self.embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-2-preview")
         return self.embeddings

@@ -1,7 +1,7 @@
 # AI Test Engineering
 
 A Python/Streamlit platform for Azure DevOps test engineering, using LangChain,
-Groq, Hugging Face embeddings and FAISS retrieval.
+Groq or local Ollama, Hugging Face embeddings and FAISS retrieval.
 
 ## Run
 
@@ -18,10 +18,11 @@ Test Engineering directly.
 ## Capabilities
 
 - Azure DevOps PAT authentication and project/team/sprint/story discovery.
-- Confluence Cloud, historical work items and document ingestion with incremental sync.
-- Project/source-scoped retrieval using the shared RAG splitter and embedding model.
-- Structured manual tests, editable revisions, selected-scenario regeneration and approval.
-- Approved test publishing to Azure Test Plans and Suites with retry recovery.
+- Choose Groq or an installed local Ollama model for generation.
+- Confluence Cloud, sprint stories and uploaded documents with automatic incremental indexing.
+- Project/source-scoped retrieval using a persistent FAISS index and shared RAG embeddings.
+- Readable story details and test cases, editable steps, revision history and approval.
+- Enter Test Plan and Test Suite IDs and click **OK - approve and upload** to publish the reviewed cases.
 - Reviewed Playwright/Cucumber workspaces, screenshot/DOM analysis and execution reports.
 - Proposed reusable framework improvements through reviewed Git worktrees and draft PRs.
 

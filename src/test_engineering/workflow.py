@@ -11,6 +11,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from src.test_engineering.knowledge import plain
 from src.test_engineering.models import TestDraft
+from src.LLMS.structured import invoke_structured
 
 
 def criteria_for(story):
@@ -54,9 +55,10 @@ def generate_tests(llm, story, context, instruction=''):
         ('human', 'CURRENT story: {story}\nAcceptance criteria: {criteria}\nHistorical context: {context}\nReview instruction: {instruction}')])
     safe_story = {'id': story['id'], 'title': plain(story['fields'].get('System.Title')),
                   'description': plain(story['fields'].get('System.Description'))}
-    output = (prompt | llm.with_structured_output(TestDraft)).invoke({
+    messages = prompt.invoke({
         'story': json.dumps(safe_story), 'criteria': json.dumps(criteria_for(story)),
         'context': json.dumps(context), 'instruction': instruction})
+    output = invoke_structured(llm, TestDraft, messages)
     if isinstance(output, TestDraft):
         output = output.model_dump()
     return validate_draft(output, story, context)
@@ -104,7 +106,7 @@ class WorkflowStore:
         finally:
             connection.close()
 
-    def save(self, story, context, draft, workflow_id=None):
+    def save(self, story, context, draft, workflow_id=None, *, expected_revision=None):
         for item in context:
             metadata = item['metadata']
             if ((metadata.get('organization_id'), metadata.get('project_id')) != (self.scope.organization_id, self.scope.project_id)
@@ -117,6 +119,8 @@ class WorkflowStore:
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             row = db.execute('SELECT current_revision FROM workflows WHERE id=?', (identifier,)).fetchone()
+            if expected_revision is not None and (not row or row[0] != expected_revision):
+                raise ValueError('Draft changed since it was opened; reload it before saving')
             revision = row[0] + 1 if row else 1
             db.execute('INSERT INTO revisions(workflow,revision,payload,digest) VALUES (?,?,?,?)',
                        (identifier, revision, payload, digest))

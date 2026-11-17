@@ -17,9 +17,27 @@ DOCX and XLSX parsers. Text, Markdown, CSV and automation source ingestion work 
 that extra. Python 3.14 is retained from the existing project.
 
 The Hugging Face token and configured embedding endpoint must support
-`google/embeddinggemma-300m`. Groq is the existing configured LLM provider. Use a
-Groq model with structured output; image analysis additionally requires a model
-supporting image input. The current INI model options are not a promise of vision support.
+`google/embeddinggemma-300m`. Choose Groq or Ollama in **LLM provider**. For Ollama,
+start the local service, install a model (for example `ollama pull llama3.2`), and
+select **Refresh local models**. The list contains installed models only; the app does
+not download them. The default server is `http://127.0.0.1:11434`; set
+`OLLAMA_BASE_URL` if your local server uses another port. Only loopback addresses are
+accepted. Use a model that can follow the structured output schema; image analysis
+also requires image input support. Selecting Ollama changes generation only: indexing
+and retrieval still use the configured Hugging Face embedding service.
+
+Provider errors are displayed without raw response bodies. Hugging Face HTTP 402
+means the embedding service's billing or credit limits need attention; see
+[Inference Providers pricing and billing](https://huggingface.co/docs/inference-providers/en/pricing).
+HTTP 403 can mean the token lacks model/inference access or the
+[EmbeddingGemma license](https://huggingface.co/google/embeddinggemma-300m) has not
+been accepted. After resolving the account issue, retry ingestion or retrieval.
+The configured embedding model and saved vector index are not changed automatically.
+
+Groq GPT-OSS models do not accept `reasoning_format`; the client omits it for those
+models. When Groq rejects a generated tool call, the application retries once with
+JSON mode and validates the result against the same Pydantic schema. Other errors,
+including authentication, are not retried as tool failures.
 
 ## Live workflow
 
@@ -31,9 +49,12 @@ supporting image input. The current INI model options are not a promise of visio
    profile/account APIs; organization policy and PAT scope may deny that operation.
 2. Select a project, team and sprint, then retrieve work items. Type names are editable
    for process templates and custom types. Search by ID/title and select a story.
-   Current fields, relations, attachments and optionally discussion history are shown.
-3. In Knowledge, sync project history, accessible Confluence Cloud pages, or local
-   documentation/source uploads. Indexing is explicit; choosing a story never embeds
+   Current fields, relations, attachments and optionally discussion history are shown
+   as readable details. New or changed retrieved work items are indexed automatically;
+   selecting a story also saves its current revision. Repeated reads skip unchanged data.
+3. In Knowledge, sync project history or accessible Confluence Cloud pages. Uploaded
+   documents and automation sources are indexed automatically, and changed files with
+   the same name replace their earlier version. Choosing a story never re-embeds
    the entire corpus. Repeat syncs detect versions/content changes and skip unchanged
    embeddings. Complete successful snapshots remove absent documents. Failed fetches
    leave prior indexed content intact and record failed status.
@@ -43,16 +64,18 @@ supporting image input. The current INI model options are not a promise of visio
 4. Generate tests using current requirements and retrieved historical evidence.
    Inspect source metadata/content and relative ranking scores. FAISS distance is
    also included; the hybrid ranking score is not a probability or confidence measure.
-5. Review/edit JSON fields, add/delete cases, or request regeneration with scenario
-   instructions. Save creates an immutable revision; approval applies to that saved
+5. Review/edit test case titles, preconditions, priorities and step tables, add/delete
+   cases, or request regeneration with scenario instructions. Save creates an immutable revision; approval applies to that saved
    revision. Unknown sources, duplicate normalized titles, invalid step numbering,
    mismatched story IDs and uncovered AC references fail validation. Reference
    coverage is mechanical; humans still verify semantic coverage and assumptions.
-6. Approve, load/select a plan and suite, or explicitly create a plan/static suite.
-   Confirm displayed project/plan/suite and publish. A changed story revision blocks
+6. Enter a Test Plan ID and Test Suite ID, or load/select existing ones. Click
+   **OK - approve and upload** to approve the displayed cases and publish them in
+   one action. Alternatively approve without uploading or create a plan/static suite.
+   The service validates the project, plan and suite before publishing. A changed story revision blocks
    publication. Created IDs and statuses are displayed. Retry uses remote fingerprint
    tags and a local journal to recover from partial failures without recreating cases.
-7. Upload screenshots and provide DOM/accessibility evidence and optional framework
+7. Upload screenshots and provide page notes, a saved browser inspection and optional framework
    conventions. Generate an automation proposal, inspect/edit the files, and create
    a separate workspace. No generated application source is placed in the RAG core.
 8. Approve the displayed code digest. Install fixed template dependencies, review
@@ -99,13 +122,13 @@ execute application scenarios. Use Node.js 22 or newer.
 | `src/integrations/http.py` | Secret-contained HTTP with safe errors and no redirects |
 | `src/integrations/azure_devops.py` | Discovery, WIQL, batches, comments, plans and suites |
 | `src/integrations/confluence.py` | Confluence Cloud v2 pages/spaces and guarded pagination |
-| `src/test_engineering/knowledge.py` | LangChain Document adapters, incremental sync, scoped hybrid retrieval |
+| `src/test_engineering/knowledge.py` | LangChain Document adapters, incremental sync, persistent scoped FAISS retrieval |
 | `src/test_engineering/models.py` | Structured test output schemas |
 | `src/test_engineering/workflow.py` | LangChain generation, coverage checks, revisions and approval |
 | `src/test_engineering/publishing.py` | Test steps XML, requirement links, suite membership and retry recovery |
 | `src/automation/workspace.py` | Multimodal proposals, trusted runner template, digest approval and reports |
 | `src/agents/framework_evolution.py` | Pattern comparison, diff review, approved worktrees/regressions/PRs |
-| `src/ui/streamlitui/test_engineering.py` | End-to-end test engineering UI |
+| `src/ui/streamlitui/test_engineering.py` / `presentation.py` | Human-readable test engineering UI and case editor |
 
 To add another knowledge connector, yield LangChain Documents with organization,
 project, source type/document ID, title, version, timestamp and source link, then call
@@ -133,6 +156,11 @@ to process-wide environment variables.
 Data is stored under ENGINEERING_DATA_DIR, namespaced by authenticated Azure identity
 and organization/project. Deployment-controlled ENGINEERING_ALLOWED_SOURCES restricts
 index access before vector search and restricts loading historical workflow context.
+Each permitted source set has a native `.faiss` index on disk. SQLite stores the
+source documents, metadata and numeric vectors; the index is rebuilt from them if
+its snapshot is outdated or damaged. A successful sync writes the native index,
+and future syncs embed only added or changed documents. JSON is used internally for
+storage and APIs rather than for everyday UI display or test case editing.
 Confluence full sync is partitioned by site so one site's snapshot cannot delete
 another site's content. Space-only sync is incremental; use an entire-site snapshot
 to detect deletions across spaces.
@@ -159,8 +187,8 @@ This local implementation must not be presented as enterprise multi-user authori
 Publishing is retry-safe within a single local store and reconciles remote fingerprint
 tags. Concurrent independent deployments can still race because Azure work-item tags
 are not a remote uniqueness constraint. Use a shared distributed publication lock
-before scaling across instances. For exceptionally large corpora, replace per-query
-FAISS reconstruction with a scoped persistent search service through this same adapter.
+before scaling across instances. For exceptionally large corpora, replace local FAISS
+rebuilds after changes with a scoped persistent search service through this same adapter.
 
 ## Connection troubleshooting
 

@@ -5,10 +5,15 @@ from hashlib import sha256
 from html.parser import HTMLParser
 from pathlib import Path
 import json
+import os
 import sqlite3
+import tempfile
 
+import faiss
+import numpy as np
 from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
+from langchain_community.docstore.in_memory import InMemoryDocstore
 
 
 class _Text(HTMLParser):
@@ -103,6 +108,10 @@ class KnowledgeIndex:
         directory = Path(root) / scope.key
         directory.mkdir(parents=True, exist_ok=True)
         self.path = directory / 'knowledge.sqlite3'
+        # A cache is scoped to precisely the permitted sources, before search.
+        sources_key = sha256(json.dumps(sorted(scope.sources)).encode()).hexdigest()[:24]
+        self.faiss_path = directory / f'knowledge-{sources_key}.faiss'
+        self.manifest_path = directory / f'knowledge-{sources_key}.manifest.json'
         with self.connect() as db:
             db.execute('CREATE TABLE IF NOT EXISTS documents (source TEXT, id TEXT, digest TEXT, payload TEXT, PRIMARY KEY(source,id))')
             db.execute('CREATE TABLE IF NOT EXISTS syncs (source TEXT PRIMARY KEY, status TEXT, count INTEGER, updated_at TEXT)')
@@ -122,6 +131,88 @@ class KnowledgeIndex:
         if metadata.get('source_type') not in self.scope.sources:
             raise PermissionError('Knowledge source access denied')
 
+    def _digest(self, doc):
+        return sha256(json.dumps([doc.page_content, doc.metadata, self.embedding_version], sort_keys=True).encode()).hexdigest()
+
+    def is_current(self, doc):
+        """Check a document's version without making an embedding request."""
+        self._check(doc.metadata)
+        with self.connect() as db:
+            row = db.execute('SELECT digest FROM documents WHERE source=? AND id=?',
+                             (doc.metadata['source_type'], str(doc.metadata['source_document_id']))).fetchone()
+        return bool(row and row[0] == self._digest(doc))
+
+    def signature(self):
+        """Identify the current authorized snapshot without calling the embedding service."""
+        with self.connect() as db:
+            _, signature = self._snapshot(db)
+        return signature
+
+    def has_other_documents(self, source, identifier):
+        """Check whether any authorized source exists besides the current document."""
+        with self.connect() as db:
+            return any(item_source in self.scope.sources and (item_source, item_id) != (source, str(identifier))
+                       for item_source, item_id in db.execute('SELECT source,id FROM documents'))
+
+    def _snapshot(self, db):
+        chunks, versions = [], []
+        for source, identifier, payload in db.execute('SELECT source,id,payload FROM documents ORDER BY source,id'):
+            if source not in self.scope.sources:
+                continue
+            saved = json.loads(payload)
+            if saved['embedding_version'] != self.embedding_version:
+                raise ValueError('Embedding version changed; synchronize all sources before retrieval')
+            metadata = saved.get('metadata')
+            if metadata:
+                self._check(metadata)
+            versions.append((source, identifier, sha256(payload.encode()).hexdigest()))
+            for chunk in saved['chunks']:
+                self._check(chunk['metadata'])
+                chunks.append(chunk)
+        signature = sha256(json.dumps([self.embedding_version, sorted(self.scope.sources), versions]).encode()).hexdigest()
+        return chunks, signature
+
+    @staticmethod
+    def _atomic_write(path, data):
+        descriptor, temporary = tempfile.mkstemp(prefix='.faiss-', dir=path.parent)
+        try:
+            with os.fdopen(descriptor, 'wb') as output:
+                output.write(data)
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def _native_index(self, chunks, signature):
+        """Load or rebuild an atomic native FAISS cache from the SQLite snapshot."""
+        try:
+            manifest = json.loads(self.manifest_path.read_text(encoding='utf-8'))
+            raw = self.faiss_path.read_bytes()
+            if (manifest.get('signature') == signature and manifest.get('count') == len(chunks)
+                    and manifest.get('sha256') == sha256(raw).hexdigest()):
+                native = faiss.deserialize_index(np.frombuffer(raw, dtype=np.uint8).copy())
+                expected_dimension = len(chunks[0]['vector']) if chunks else 1
+                if native.ntotal == len(chunks) and native.d == expected_dimension:
+                    return native
+        except (OSError, ValueError, KeyError, RuntimeError, TypeError, AttributeError):
+            pass  # A missing, stale or corrupt cache can be rebuilt from stored vectors.
+        try:
+            vectors = np.asarray([chunk['vector'] for chunk in chunks], dtype=np.float32)
+        except (TypeError, ValueError):
+            raise ValueError('Stored embeddings are invalid; re-index the affected knowledge sources') from None
+        if chunks:
+            if vectors.ndim != 2 or vectors.shape[1] == 0 or not np.isfinite(vectors).all():
+                raise ValueError('Stored embeddings are invalid; re-index the affected knowledge sources')
+            native = faiss.IndexFlatL2(vectors.shape[1])
+            native.add(vectors)
+        else:
+            native = faiss.IndexFlatL2(1)
+        raw = faiss.serialize_index(native).tobytes()
+        manifest = {'signature': signature, 'count': len(chunks), 'sha256': sha256(raw).hexdigest()}
+        self._atomic_write(self.faiss_path, raw)
+        self._atomic_write(self.manifest_path, json.dumps(manifest).encode())
+        return native
+
     def sync(self, documents, source, *, full_snapshot=False, partition=None, force=False):
         if source not in self.scope.sources:
             raise PermissionError('Knowledge source access denied')
@@ -138,7 +229,7 @@ class KnowledgeIndex:
         # Materialize before mutations: a failed paginated fetch cannot delete prior data.
         documents = list(documents)
         ids, changed, unchanged = set(), 0, 0
-        prepared = []
+        pending = []
         with self.connect() as db:
             existing = {}
             for identifier, digest, payload in db.execute('SELECT id,digest,payload FROM documents WHERE source=?', (source,)):
@@ -157,20 +248,44 @@ class KnowledgeIndex:
             if identifier in ids:
                 raise ValueError('Duplicate source document ID')
             ids.add(identifier)
-            digest = sha256(json.dumps([doc.page_content, doc.metadata, self.embedding_version], sort_keys=True).encode()).hexdigest()
+            digest = self._digest(doc)
             if existing.get(identifier) == digest and not force:
                 unchanged += 1
                 continue
             chunks = self.rag.split_documents([doc])
-            vectors = self.rag.create_embeddings().embed_documents([c.page_content for c in chunks]) if chunks else []
-            payload = {'embedding_version': self.embedding_version, 'metadata': doc.metadata, 'chunks': [
-                {'content': c.page_content, 'metadata': c.metadata, 'vector': v} for c, v in zip(chunks, vectors, strict=True)]}
-            prepared.append((source, identifier, digest, json.dumps(payload)))
+            pending.append((identifier, digest, doc.metadata, chunks))
             changed += 1
+        all_chunks = [chunk for _, _, _, chunks in pending for chunk in chunks]
+        all_vectors = []
+        if all_chunks:
+            embeddings = self.rag.create_embeddings()
+            for offset in range(0, len(all_chunks), 16):
+                batch = all_chunks[offset:offset + 16]
+                vectors = embeddings.embed_documents([chunk.page_content for chunk in batch])
+                if len(vectors) != len(batch):
+                    raise ValueError('Embedding service returned an incomplete batch; retry the sync')
+                all_vectors.extend(vectors)
+        prepared, position = [], 0
+        for identifier, digest, metadata, chunks in pending:
+            vectors = all_vectors[position:position + len(chunks)]
+            position += len(chunks)
+            payload = {'embedding_version': self.embedding_version, 'metadata': metadata, 'chunks': [
+                {'content': chunk.page_content, 'metadata': chunk.metadata, 'vector': vector}
+                for chunk, vector in zip(chunks, vectors, strict=True)]}
+            prepared.append((source, identifier, digest, json.dumps(payload)))
         removed = set(existing) - ids if full_snapshot else set()
         with self.connect() as db:
             db.executemany('INSERT OR REPLACE INTO documents VALUES (?,?,?,?)', prepared)
             db.executemany('DELETE FROM documents WHERE source=? AND id=?', [(source, i) for i in removed])
+            # Write a real FAISS index from persisted vectors. If an embedding model
+            # changed, allow sources to be re-indexed one by one before rebuilding.
+            try:
+                chunks, signature = self._snapshot(db)
+            except ValueError as error:
+                if str(error) != 'Embedding version changed; synchronize all sources before retrieval':
+                    raise
+            else:
+                self._native_index(chunks, signature)
             db.execute("INSERT OR REPLACE INTO syncs VALUES (?, 'complete', ?, datetime('now'))", (source, len(ids)))
         return {'changed': changed, 'unchanged': unchanged, 'deleted': len(removed)}
 
@@ -184,22 +299,15 @@ class KnowledgeIndex:
         queries = [plain(fields.get('System.Title', '')),
                    plain(fields.get('Microsoft.VSTS.Common.AcceptanceCriteria', '')),
                    plain(fields.get('System.Description', ''))]
-        chunks = []
         with self.connect() as db:
-            for source, payload in db.execute('SELECT source,payload FROM documents'):
-                if source not in self.scope.sources:
-                    continue
-                saved = json.loads(payload)
-                if saved['embedding_version'] != self.embedding_version:
-                    raise ValueError('Embedding version changed; synchronize all sources before retrieval')
-                for chunk in saved['chunks']:
-                    self._check(chunk['metadata'])
-                    chunks.append(chunk)
+            chunks, signature = self._snapshot(db)
+        native = self._native_index(chunks, signature)
         if not chunks:
             return []
-        # Build only from authorized sources BEFORE search. Persisted numeric vectors avoid pickle.
-        store = FAISS.from_embeddings([(c['content'], c['vector']) for c in chunks],
-                                      self.rag.create_embeddings(), metadatas=[c['metadata'] for c in chunks])
+        # The index contains only authorized sources; document text remains in SQLite.
+        documents = {str(i): Document(page_content=c['content'], metadata=c['metadata']) for i, c in enumerate(chunks)}
+        store = FAISS(embedding_function=self.rag.create_embeddings(), index=native,
+                      docstore=InMemoryDocstore(documents), index_to_docstore_id={i: str(i) for i in range(len(chunks))})
         ranked = {}
         import re
         terms = set(re.findall(r'\w+', ' '.join(queries).lower()))

@@ -13,6 +13,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import Field
 
 from src.test_engineering.models import StrictModel
+from src.LLMS.structured import invoke_structured
 
 
 class GeneratedFile(StrictModel):
@@ -65,7 +66,7 @@ def generate_automation(llm, workflow, inspection, screenshots=(), conventions='
         if mime not in ('image/png', 'image/jpeg') or len(data) > 8 * 1024 * 1024:
             raise ValueError('Use PNG/JPEG screenshots under 8 MB')
         content.append({'type': 'image_url', 'image_url': {'url': f'data:{mime};base64,' + base64.b64encode(data).decode()}})
-    return llm.with_structured_output(AutomationProposal).invoke([
+    return invoke_structured(llm, AutomationProposal, [
         SystemMessage(content=system), HumanMessage(content=content)])
 
 

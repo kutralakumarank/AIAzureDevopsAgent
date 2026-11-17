@@ -103,6 +103,19 @@ against the user's organization.
 Verification after the fix: all 33 tests pass in an isolated environment; Python
 compilation and the dependency lock check also pass. No live PAT was used.
 
+## Provider error follow-up
+
+A live probe using a non-sensitive sample authenticated to Hugging Face, but the
+embedding inference request returned HTTP 402. The account's inference credits or
+billing must be checked before remote embeddings can be used. The app now reports
+that condition and other provider failures without displaying response bodies.
+
+Groq GPT-OSS requests no longer include the unsupported `reasoning_format`
+parameter. Failed tool generation receives one JSON-mode retry with the same
+Pydantic validation. A live Groq request has not been verified; the request changes,
+safe error display and fallback are covered by mocked tests. The existing embedding
+model and stored vector index were retained.
+
 ## Follow-up cleanup
 
 Removed debug prints, unused imports, dead session state, redundant error handling

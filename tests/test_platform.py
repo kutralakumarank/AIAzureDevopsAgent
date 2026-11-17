@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import shutil
 import subprocess
+from unittest.mock import patch
 
 import httpx
 from langchain_core.embeddings import Embeddings
@@ -16,10 +17,12 @@ from src.integrations.confluence import Confluence
 from src.integrations.http import IntegrationError
 from src.test_engineering.knowledge import KnowledgeIndex, Scope, story_document, file_documents
 from src.test_engineering.workflow import WorkflowStore, validate_draft, criteria_for, generate_tests, regenerate_selected
-from src.test_engineering.publishing import Publisher, steps_xml
+from src.test_engineering.publishing import Publisher, approve_and_publish, steps_xml
 from src.test_engineering.models import TestDraft
 from src.automation.workspace import AutomationWorkspace, safe_file
 from src.agents.framework_evolution import build_diff, create_review_branch
+from src.LLMS.provider_errors import is_groq_tool_failure, provider_error_message
+from src.LLMS.groqllm import GroqLLM
 
 
 class LocalEmbeddings(Embeddings):
@@ -33,6 +36,135 @@ class LocalEmbeddings(Embeddings):
     def embed_query(self, text):
         value = text.lower()
         return [float(value.count('customer')), float(value.count('required')), float(value.count('bug')), 1.0]
+
+
+class ProviderTests(unittest.TestCase):
+    def test_ollama_discovery_and_local_only_connection(self):
+        from src.LLMS.ollamallm import list_ollama_models, local_url, ollama_llm
+        response = httpx.Response(200, json={'models': [{'name': 'z:latest'}, {'name': 'a:latest'}, {'name': 'a:latest'}]},
+                                  request=httpx.Request('GET', 'http://127.0.0.1:11434/api/tags'))
+        with patch('src.LLMS.ollamallm.httpx.get', return_value=response) as get:
+            self.assertEqual(list_ollama_models('http://127.0.0.1:11434'), ['a:latest', 'z:latest'])
+            self.assertFalse(get.call_args.kwargs['trust_env'])
+        for url in ('https://example.com', 'http://localhost:11434/path', 'http://user:pass@localhost:11434'):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                local_url(url)
+        llm = ollama_llm('a:latest', 'http://127.0.0.1:11434')
+        self.assertEqual(llm.model, 'a:latest')
+        self.assertEqual(llm.base_url, 'http://127.0.0.1:11434')
+        with self.assertRaises(ValueError):
+            ollama_llm('', 'http://127.0.0.1:11434')
+
+    def test_ollama_structured_generation_against_local_service(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from src.LLMS.ollamallm import ollama_llm
+        requests = []
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def do_POST(self):
+                data = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                requests.append(data)
+                result = {'model': data['model'], 'created_at': '2026-01-01T00:00:00Z',
+                          'message': {'role': 'assistant', 'content': json.dumps(draft())},
+                          'done': True, 'done_reason': 'stop'}
+                content = (json.dumps(result) + '\n').encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/x-ndjson')
+                self.send_header('Content-Length', str(len(content)))
+                self.end_headers()
+                self.wfile.write(content)
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            llm = ollama_llm('local-model', f'http://127.0.0.1:{server.server_port}')
+            result = generate_tests(llm, story(), [])
+            self.assertEqual(result.test_cases[0].story_id, 123)
+            self.assertEqual(requests[0]['model'], 'local-model')
+            self.assertIsInstance(requests[0]['format'], dict)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_groq_reasoning_parameters_match_selected_model(self):
+        for model, expected in [('openai/gpt-oss-120b', None), ('llama-3.1-8b-instant', None),
+                                ('qwen/qwen3.8-27b', 'hidden')]:
+            with self.subTest(model=model), patch('src.LLMS.groqllm.ChatGroq') as client:
+                GroqLLM({'GROQ_API_KEY': 'test-key', 'selected_groq_model': model}).get_llm_model()
+                options = client.call_args.kwargs
+                self.assertEqual(options.get('reasoning_format'), expected)
+                self.assertEqual(options['model'], model)
+
+    def test_provider_errors_are_actionable_without_raw_messages(self):
+        from groq import BadRequestError
+        from huggingface_hub.errors import HfHubHTTPError
+        request = httpx.Request('POST', 'https://example.invalid')
+        response = httpx.Response(402, request=request)
+        error = HfHubHTTPError('private-token-and-document', response=response)
+        message = provider_error_message(error)
+        self.assertIn('HTTP 402', message)
+        self.assertIn('credits and billing', message)
+        self.assertNotIn('private-token-and-document', message)
+        response = httpx.Response(400, request=request)
+        error = BadRequestError('private-token-and-document', response=response,
+                                body={'code': 'tool_use_failed', 'failed_generation': 'private-token-and-document'})
+        message = provider_error_message(error)
+        self.assertIn('structured response', message)
+        self.assertNotIn('private-token-and-document', message)
+
+    def test_failed_tool_call_retries_json_and_validates_result(self):
+        from groq import BadRequestError
+        from langchain_core.runnables import RunnableLambda
+        request = httpx.Request('POST', 'https://example.invalid')
+        error = BadRequestError('private output', response=httpx.Response(400, request=request),
+                                body={'code': 'tool_use_failed', 'failed_generation': 'private output'})
+        class Model:
+            def __init__(self):
+                self.methods = []
+            def with_structured_output(self, schema, **kwargs):
+                self.methods.append(kwargs.get('method', 'function_calling'))
+                if len(self.methods) == 1:
+                    def fail(_):
+                        raise error
+                    return RunnableLambda(fail)
+                def reply(messages):
+                    self.assert_schema_present = 'JSON schema' in messages[0].content
+                    return schema.model_validate(draft())
+                return RunnableLambda(reply)
+        model = Model()
+        result = generate_tests(model, story(), [])
+        self.assertEqual(model.methods, ['function_calling', 'json_mode'])
+        self.assertTrue(model.assert_schema_present)
+        self.assertEqual(result.test_cases[0].story_id, 123)
+
+    def test_other_groq_bad_requests_are_not_retried(self):
+        from groq import BadRequestError
+        from langchain_core.runnables import RunnableLambda
+        request = httpx.Request('POST', 'https://example.invalid')
+        error = BadRequestError('private output', response=httpx.Response(400, request=request),
+                                body={'code': 'model_decommissioned', 'failed_generation': 'private output'})
+        class Model:
+            calls = 0
+            def with_structured_output(self, schema, **kwargs):
+                self.calls += 1
+                def fail(_):
+                    raise error
+                return RunnableLambda(fail)
+        model = Model()
+        with self.assertRaises(BadRequestError):
+            generate_tests(model, story(), [])
+        self.assertEqual(model.calls, 1)
+
+    def test_documented_tool_failure_without_code_is_recognized(self):
+        from groq import BadRequestError
+        request = httpx.Request('POST', 'https://example.invalid')
+        error = BadRequestError('private output', response=httpx.Response(400, request=request),
+                                body={'error': {'type': 'invalid_request_error', 'failed_generation': {'reason': 'bad JSON'}}})
+        self.assertTrue(is_groq_tool_failure(error))
+        self.assertNotIn('private output', provider_error_message(error))
 
 
 def story():
@@ -198,6 +330,91 @@ class KnowledgeTests(unittest.TestCase):
         self.assertEqual(resumed.sync([], 'azure_devops', full_snapshot=True)['deleted'], 1)
         self.assertEqual(resumed.retrieve(story()), [])
 
+    def test_faiss_persists_stories_and_documents_and_recovers_from_corruption(self):
+        import faiss
+        first_story = story_document(story(), self.scope)
+        self.index.sync([first_story], 'azure_devops')
+        self.assertTrue(self.index.faiss_path.is_file())
+        self.assertEqual(faiss.read_index(str(self.index.faiss_path)).ntotal, 1)
+
+        file_path = Path(self.temp.name) / 'requirements.txt'
+        file_path.write_text('Customer name is required for all customers.', encoding='utf-8')
+        document = file_documents(file_path, self.scope)[0]
+        self.index.sync([document], 'files')
+        self.assertTrue(self.index.is_current(first_story))
+        self.assertTrue(self.index.is_current(document))
+        self.assertEqual(faiss.read_index(str(self.index.faiss_path)).ntotal, 2)
+
+        changed_story = story()
+        changed_story['rev'] = 3
+        changed_story['fields']['System.Description'] = 'Updated customer requirements'
+        updated = story_document(changed_story, self.scope)
+        self.assertFalse(self.index.is_current(updated))
+        previous_calls = self.embeddings.calls
+        self.index.sync([updated], 'azure_devops')
+        self.assertEqual(self.embeddings.calls, previous_calls + 1)
+        self.assertTrue(self.index.is_current(document))
+        self.assertEqual(faiss.read_index(str(self.index.faiss_path)).ntotal, 2)
+
+        resumed = KnowledgeIndex(self.temp.name, self.scope, self.rag)
+        with patch('src.test_engineering.knowledge.faiss.IndexFlatL2', side_effect=AssertionError('Index rebuilt unnecessarily')):
+            self.assertEqual(len(resumed.retrieve(changed_story)), 2)
+        resumed.faiss_path.write_bytes(b'invalid cache')
+        self.assertEqual(len(resumed.retrieve(changed_story)), 2)
+        self.assertEqual(faiss.read_index(str(resumed.faiss_path)).ntotal, 2)
+
+        restricted = Scope(self.scope.organization_id, self.scope.project_id, frozenset({'files'}))
+        restricted_index = KnowledgeIndex(self.temp.name, restricted, self.rag)
+        self.assertEqual(len(restricted_index.retrieve(changed_story)), 1)
+        self.assertEqual(faiss.read_index(str(restricted_index.faiss_path)).ntotal, 1)
+
+    def test_new_documents_are_embedded_in_batches_and_unchanged_are_skipped(self):
+        class RecordingEmbeddings(LocalEmbeddings):
+            def __init__(self):
+                super().__init__()
+                self.batches = []
+            def embed_documents(self, texts):
+                self.batches.append(len(texts))
+                return super().embed_documents(texts)
+        embeddings = RecordingEmbeddings()
+        index = KnowledgeIndex(self.temp.name, self.scope, Rag(embeddings=embeddings))
+        docs = []
+        for identifier in range(100, 117):
+            item = story()
+            item['id'] = identifier
+            docs.append(story_document(item, self.scope))
+        result = index.sync(docs, 'azure_devops')
+        self.assertEqual(result['changed'], 17)
+        self.assertEqual(embeddings.batches, [16, 1])
+        self.assertEqual(index.sync(docs, 'azure_devops')['unchanged'], 17)
+        self.assertEqual(embeddings.batches, [16, 1])
+
+    def test_failed_embedding_batch_preserves_existing_documents_and_faiss(self):
+        existing = story_document(story(), self.scope)
+        self.index.sync([existing], 'azure_devops')
+        original_index = self.index.faiss_path.read_bytes()
+        class FailingEmbeddings(LocalEmbeddings):
+            def __init__(self):
+                super().__init__()
+                self.batches = 0
+            def embed_documents(self, texts):
+                self.batches += 1
+                if self.batches == 2:
+                    raise RuntimeError('Embedding service unavailable')
+                return super().embed_documents(texts)
+        failing = KnowledgeIndex(self.temp.name, self.scope, Rag(embeddings=FailingEmbeddings()))
+        docs = []
+        for identifier in range(100, 117):
+            item = story()
+            item['id'] = identifier
+            docs.append(story_document(item, self.scope))
+        with self.assertRaises(RuntimeError):
+            failing.sync(docs, 'azure_devops', full_snapshot=True)
+        self.assertTrue(self.index.is_current(existing))
+        self.assertFalse(self.index.is_current(docs[0]))
+        self.assertEqual(self.index.faiss_path.read_bytes(), original_index)
+        self.assertEqual(self.index.status()[0]['status'], 'failed')
+
     def test_project_and_source_isolation_before_search(self):
         doc = story_document(story(), self.scope)
         doc.metadata['project_id'] = 'another'
@@ -300,6 +517,45 @@ class ReviewTests(unittest.TestCase):
             self.store.approve(identifier, 1, current['digest'], explicit=True)
         self.assertEqual(len(self.store.history(identifier)), 2)
 
+    def test_one_confirmation_saves_approves_and_publishes_displayed_cases(self):
+        identifier = self.store.save(story(), [], draft())
+        current = self.store.load(identifier)
+        updated = copy.deepcopy(draft())
+        updated['test_cases'][0]['title'] = 'Edited case title'
+        class FakePublisher:
+            def __init__(self, store):
+                self.store, self.calls = store, []
+            def publish(self, workflow_id, plan_id, suite_id, **kwargs):
+                current = self.store.load(workflow_id)
+                self.calls.append((workflow_id, plan_id, suite_id, kwargs, current))
+                return [{'case_id': 101, 'title': current['draft']['test_cases'][0]['title'], 'status': 'published'}]
+        publisher = FakePublisher(self.store)
+        with self.assertRaises(PermissionError):
+            approve_and_publish(publisher, identifier, 1, current['digest'], updated, '5', '7')
+        with self.assertRaises(ValueError):
+            approve_and_publish(publisher, identifier, 1, current['digest'], updated, 'bad', '7', explicit=True)
+        self.assertEqual(publisher.calls, [])
+        self.assertFalse(self.store.load(identifier)['approved'])
+        result = approve_and_publish(publisher, identifier, 1, current['digest'], updated, '5', '7', explicit=True)
+        self.assertEqual(result[0]['title'], 'Edited case title')
+        self.assertEqual(publisher.calls[0][1:3], (5, 7))
+        self.assertTrue(publisher.calls[0][3]['explicit'])
+        self.assertEqual(publisher.calls[0][4]['revision'], 2)
+        self.assertTrue(publisher.calls[0][4]['approved'])
+
+    def test_approval_rejects_a_stale_displayed_revision(self):
+        identifier = self.store.save(story(), [], draft())
+        current = self.store.load(identifier)
+        self.store.save(story(), [], draft(), identifier, expected_revision=1)
+        class FakePublisher:
+            store = self.store
+            def publish(self, *args, **kwargs):
+                raise AssertionError('A stale draft must not be published')
+        with self.assertRaises(ValueError):
+            approve_and_publish(FakePublisher(), identifier, 1, current['digest'], draft(), '5', '7', explicit=True)
+        with self.assertRaises(ValueError):
+            self.store.save(story(), [], draft(), identifier, expected_revision=1)
+
     def test_coverage_traceability_and_duplicates(self):
         self.assertEqual(set(criteria_for(story())), {'AC1', 'AC2'})
         for mutation in ('coverage', 'source', 'story', 'duplicate', 'steps'):
@@ -356,7 +612,7 @@ class ReviewTests(unittest.TestCase):
     def test_publish_approval_retry_and_partial_remote_recovery(self):
         identifier = self.store.save(story(), [], draft())
         current = self.store.load(identifier)
-        created, memberships, remote = [], [], {}
+        created, memberships, remote, suite_members = [], [], {}, set()
         def handler(request):
             path = request.url.path
             if path.endswith('/_apis/projects/p'):
@@ -374,23 +630,27 @@ class ReviewTests(unittest.TestCase):
                 remote['id'] = 77
                 return httpx.Response(200, json={'id': 77})
             if path.endswith('/TestCase'):
+                if request.method == 'GET':
+                    return httpx.Response(200, json={'value': [{'workItem': {'id': case_id}} for case_id in suite_members]})
                 memberships.append(json.loads(request.content))
                 if len(memberships) == 1:
                     return httpx.Response(500, json={})
+                suite_members.add(memberships[-1][0]['workItem']['id'])
                 return httpx.Response(200, json=[])
             raise AssertionError(path)
         azure = AzureDevOps(self.scope.organization_id, SecretStr('secret'), transport=httpx.MockTransport(handler))
         publisher = Publisher(azure, self.store, 'p')
         with self.assertRaises(PermissionError):
             publisher.publish(identifier, 1, 2, explicit=True, expected_digest=current['digest'])
-        self.store.approve(identifier, 1, current['digest'], explicit=True)
         with self.assertRaises(IntegrationError):
-            publisher.publish(identifier, 1, 2, explicit=True, expected_digest=current['digest'])
-        result = publisher.publish(identifier, 1, 2, explicit=True, expected_digest=current['digest'])
+            approve_and_publish(publisher, identifier, 1, current['digest'], draft(), 1, 2, explicit=True)
+        self.assertTrue(self.store.load(identifier)['approved'])
+        result = approve_and_publish(publisher, identifier, 1, current['digest'], draft(), 1, 2, explicit=True)
         self.assertEqual(result[0]['case_id'], 77)
         self.assertEqual(len(created), 1)
         publisher.publish(identifier, 1, 2, explicit=True, expected_digest=current['digest'])
         self.assertEqual(len(created), 1)
+        self.assertEqual(len(memberships), 2)
         self.assertTrue(any(p['path'] == '/relations/-' for p in created[0]))
         azure.close()
 
