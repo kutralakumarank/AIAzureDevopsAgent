@@ -9,6 +9,24 @@ from streamlit.testing.v1 import AppTest
 
 
 class UITests(unittest.TestCase):
+    def test_related_knowledge_groups_chunks_by_source(self):
+        code = '''from src.ui.streamlitui.presentation import show_evidence
+base = {"organization_id": "org", "project_id": "project", "source_type": "files", "title": "Requirements.pdf"}
+show_evidence([
+    {"reference_id": "a", "metadata": {**base, "source_document_id": "first"}, "content": "First passage"},
+    {"reference_id": "b", "metadata": {**base, "source_document_id": "first"}, "content": "Second passage"},
+    {"reference_id": "c", "metadata": {**base, "source_document_id": "first"}, "content": "First passage"},
+    {"reference_id": "d", "metadata": {**base, "source_document_id": "second"}, "content": "Different document"},
+])
+'''
+        app = AppTest.from_string(code, default_timeout=60).run()
+        self.assertFalse(app.exception)
+        self.assertEqual(len(app.expander), 2)
+        rendered = [item.value for item in app.markdown]
+        self.assertEqual(rendered.count('First passage'), 1)
+        self.assertIn('Second passage', rendered)
+        self.assertIn('Different document', rendered)
+
     def test_selector_names_and_provider_switch(self):
         code = '''from src.ui.streamlitui.test_engineering import pick, model_controls
 for label in ("Project", "Team", "Sprint"):
@@ -61,7 +79,8 @@ model_controls()
             app.run()
             self.assertFalse(app.exception)
             self.assertFalse(app.error)
-            self.assertEqual([tab.label for tab in app.tabs], ['Stories', 'Knowledge', 'Review and publish', 'Automation', 'Framework evolution'])
+            self.assertEqual([tab.label for tab in app.tabs], ['Stories', 'Knowledge', 'Review and publish'])
+            self.assertFalse(any('Discover other accessible organizations' in button.label for button in app.button))
 
     def test_connect_uses_streamlit_credentials_instead_of_environment(self):
         azure = MagicMock()
@@ -143,14 +162,14 @@ model_controls()
             first_calls = embeddings.calls
             app.run()
             self.assertEqual(embeddings.calls, first_calls)
-            uploader = next(item for item in app.file_uploader if item.label == 'Add business documents or automation source')
+            uploader = next(item for item in app.file_uploader if item.label == 'Add business documents')
             uploader.set_value([('requirements.txt', b'Customer name is required.', 'text/plain')]).run()
             self.assertFalse(app.exception)
             self.assertEqual(embeddings.calls, first_calls + 1)
             self.assertEqual(faiss.read_index(str(index.faiss_path)).ntotal, 2)
             app.run()
             self.assertEqual(embeddings.calls, first_calls + 1)
-            uploader = next(item for item in app.file_uploader if item.label == 'Add business documents or automation source')
+            uploader = next(item for item in app.file_uploader if item.label == 'Add business documents')
             uploader.set_value([('requirements.txt', b'Customer name is required and unique.', 'text/plain'),
                                 ('workflow.txt', b'Customer approval workflow.', 'text/plain')]).run()
             self.assertFalse(app.exception)
@@ -267,6 +286,7 @@ model_controls()
                 self.assertFalse(app.exception)
                 self.assertFalse(app.error)
                 self.assertFalse(app.get('json'))
+                self.assertFalse(any(item.label == 'Automation feasibility' for item in app.selectbox))
                 prefix = f'case_{scope.key}_{identifier}_1_1'
                 app.text_input(key=prefix + '_title').set_value('User edited case')
                 app.text_input(key=f'engineering_plan_id_{scope.key}_{identifier}').set_value('12')
@@ -278,6 +298,7 @@ model_controls()
                 self.assertEqual(current['revision'], 2)
                 self.assertTrue(current['approved'])
                 self.assertEqual(current['draft']['test_cases'][0]['title'], 'User edited case')
+                self.assertEqual(current['draft']['test_cases'][0]['automation_feasibility'], 'High')
                 args, kwargs = publisher.publish.call_args
                 self.assertEqual(args, (identifier, 12, 34))
                 self.assertTrue(kwargs['explicit'])

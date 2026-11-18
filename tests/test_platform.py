@@ -312,6 +312,11 @@ class KnowledgeTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_new_knowledge_does_not_create_sqlite_database(self):
+        self.index.sync([story_document(story(), self.scope)], 'azure_devops')
+        self.assertFalse((Path(self.temp.name) / self.scope.key / 'knowledge.sqlite3').exists())
+        self.assertTrue(self.index.retrieve(story()))
+
     def test_incremental_versions_deletions_and_resume(self):
         doc = story_document(story(), self.scope)
         self.assertEqual(self.index.sync([doc], 'azure_devops')['changed'], 1)
@@ -443,6 +448,23 @@ class KnowledgeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             other.retrieve(story())
 
+    def test_embedding_model_migration_allows_sources_to_be_resynced_one_at_a_time(self):
+        doc = story_document(story(), self.scope)
+        path = Path(self.temp.name) / 'requirements.txt'
+        path.write_text('Customer name is required.', encoding='utf-8')
+        file_doc = file_documents(path, self.scope)[0]
+        self.index.sync([doc], 'azure_devops')
+        self.index.sync([file_doc], 'files')
+        class NewEmbeddings(LocalEmbeddings):
+            def embed_query(self, text):
+                return super().embed_query(text) + [2.0]
+        migrated = KnowledgeIndex(self.temp.name, self.scope, Rag(embeddings=NewEmbeddings()), embedding_version='next')
+        migrated.sync([doc], 'azure_devops')
+        with self.assertRaisesRegex(ValueError, 'Embedding version changed'):
+            migrated.retrieve(story())
+        migrated.sync([file_doc], 'files')
+        self.assertEqual(len(migrated.retrieve(story())), 2)
+
     def test_text_loader_and_shared_splitter(self):
         path = Path(self.temp.name) / 'requirements.md'
         path.write_text('Customer ' * 500, encoding='utf-8')
@@ -501,6 +523,26 @@ class ReviewTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_simultaneous_revision_saves_reject_a_stale_writer(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+        identifier = self.store.save(story(), [], draft())
+        start = Barrier(2)
+        def save_revision(_):
+            other = WorkflowStore(self.temp.name, self.scope)
+            start.wait()
+            try:
+                other.save(story(), [], draft(), identifier, expected_revision=1)
+                return 'saved'
+            except ValueError:
+                return 'stale'
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(save_revision, range(2)))
+        self.assertCountEqual(results, ['saved', 'stale'])
+        self.assertEqual(self.store.load(identifier)['revision'], 2)
+        self.assertEqual(len(self.store.history(identifier)), 2)
+        self.assertTrue(self.store.path.name.endswith('.json'))
 
     def test_revision_approval_and_resume(self):
         identifier = self.store.save(story(), [], draft())

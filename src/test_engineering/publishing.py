@@ -80,11 +80,10 @@ class Publisher:
         results = []
         # Serialize local publishers. The remote fingerprint also permits retry after a crash
         # between remote creation and local journaling (not a distributed uniqueness guarantee).
-        with self.store.connect() as db:
-            db.execute('BEGIN IMMEDIATE')
-            current = db.execute('SELECT r.digest,r.approved FROM revisions r JOIN workflows w '
-                                 'ON w.id=r.workflow AND w.current_revision=r.revision WHERE w.id=?', (workflow_id,)).fetchone()
-            if not current or current[0] != expected_digest or not current[1]:
+        with self.store.transaction() as state:
+            current = state['workflows'].get(workflow_id)
+            current = current['revisions'][str(current['current_revision'])] if current else None
+            if not current or current['digest'] != expected_digest or not current['approved']:
                 raise PermissionError('Draft changed before publishing; review and approve the latest revision')
             suite_path = f'/{segment(self.project)}/_apis/testplan/Plans/{int(plan_id)}/Suites/{int(suite_id)}/TestCase'
             existing_cases = self.azure.values(suite_path)
@@ -93,8 +92,8 @@ class Publisher:
             for case in draft.test_cases:
                 fingerprint = sha256(json.dumps([self.store.scope.key, case.model_dump()], sort_keys=True).encode()).hexdigest()
                 tag = 'ai-test-' + fingerprint
-                row = db.execute('SELECT case_id,status FROM publications WHERE fingerprint=?', (fingerprint,)).fetchone()
-                case_id = row[0] if row else None
+                row = state['publications'].get(fingerprint)
+                case_id = row['case_id'] if row else None
                 if not case_id:
                     query = (f'SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = {wiql_literal(project["name"])} '
                              f'AND [System.WorkItemType] = \'Test Case\' AND [System.Tags] CONTAINS {wiql_literal(tag)}')
@@ -126,7 +125,7 @@ class Publisher:
                 if str(case_id) not in suite_ids:
                     self.azure.request('POST', suite_path, json=[{'workItem': {'id': int(case_id)}}])
                     suite_ids.add(str(case_id))
-                db.execute('INSERT OR REPLACE INTO publications(fingerprint,case_id,status) VALUES (?,?,?)',
-                           (fingerprint, case_id, 'published'))
+                state['publications'][fingerprint] = {'case_id': case_id, 'status': 'published'}
+                self.store._write(state)
                 results.append({'case_id': case_id, 'status': 'published', 'title': case.title})
         return results

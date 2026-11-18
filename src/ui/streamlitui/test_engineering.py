@@ -18,11 +18,12 @@ from src.RAG.Rag import Rag
 from src.test_engineering.knowledge import Scope, KnowledgeIndex, story_document, confluence_documents, file_documents
 from src.test_engineering.workflow import WorkflowStore, generate_tests, regenerate_selected, criteria_for, validate_draft
 from src.test_engineering.publishing import Publisher, approve_review, approve_and_publish
-from src.automation.workspace import AutomationWorkspace, AutomationProposal, generate_automation, analyze_failures
-from src.agents.framework_evolution import propose_evolution, build_diff, create_review_branch, regression_and_pr
+# Automation and framework evolution are disabled in the UI.
+# from src.automation.workspace import AutomationWorkspace, AutomationProposal, generate_automation, analyze_failures
+# from src.agents.framework_evolution import propose_evolution, build_diff, create_review_branch, regression_and_pr
 from src.ui.streamlitui.presentation import (show_details, show_story, show_comments, show_evidence,
-                                              show_sync, show_results, edit_draft, validate_editor_fields,
-                                              editable_proposal)
+                                              show_sync, show_results, edit_draft, validate_editor_fields)
+# from src.ui.streamlitui.presentation import editable_proposal
 
 
 def pick(label, items, key):
@@ -112,7 +113,7 @@ def ensure_indexed(index, document, attempt_key, label):
 def render():
     st.set_page_config(page_title='AI Test Engineering', layout='wide')
     st.title('AI Test Engineering')
-    st.caption('Existing LangChain RAG · Azure DevOps · Confluence · reviewed automation')
+    st.caption('LangChain RAG · Azure DevOps · Confluence · manual test engineering')
     try:
         _render()
     except Exception as error:
@@ -156,13 +157,6 @@ def _render():
     if not azure:
         st.info('Enter your Azure DevOps organization URL and PAT above, then connect to discover projects.')
         return
-    if st.button('Discover other accessible organizations (where PAT policy permits)'):
-        accounts = azure.accounts()
-        if accounts:
-            st.dataframe([{'Organization': account.get('accountName', 'Unknown'), 'ID': account.get('accountId', '')}
-                          for account in accounts], hide_index=True, width='stretch')
-        else:
-            st.info('No other accessible organizations were returned.')
     project = pick('Project', st.session_state['engineering_projects'], 'engineering_project')
     if not project:
         return
@@ -176,7 +170,8 @@ def _render():
     index = KnowledgeIndex(root, scope, rag, os.getenv('ENGINEERING_EMBEDDING_VERSION', 'google/embeddinggemma-300m:v1'))
     store = WorkflowStore(root, scope)
     controls = model_controls()
-    tabs = st.tabs(['Stories', 'Knowledge', 'Review and publish', 'Automation', 'Framework evolution'])
+    tabs = st.tabs(['Stories', 'Knowledge', 'Review and publish'])
+    # Automation and Framework evolution tabs are intentionally disabled.
     with tabs[0]:
         team = pick('Team', azure.teams(project['id']), 'engineering_team')
         iteration = pick('Sprint', azure.iterations(project['id'], team['id']), 'engineering_iteration') if team else None
@@ -281,7 +276,7 @@ def _render():
                                          full_snapshot=not bool(space), partition=connector.http.base, force=force), 'Confluence pages')
                 finally:
                     connector.close()
-        uploads = st.file_uploader('Add business documents or automation source',
+        uploads = st.file_uploader('Add business documents',
                                    type=['pdf', 'docx', 'xlsx', 'csv', 'txt', 'md', 'ts', 'js', 'py', 'feature', 'json'],
                                    accept_multiple_files=True)
         if uploads:
@@ -310,11 +305,11 @@ def _render():
                 if updated:
                     st.rerun()
     with tabs[2]:
-        workflow = _render_review(store, index, azure, project, scope, controls)
-    with tabs[3]:
-        _automation(workflow, root / scope.key / 'automation', controls)
-    with tabs[4]:
-        _evolution(controls)
+        _render_review(store, index, azure, project, scope, controls)
+    # with tabs[3]:
+    #     _automation(workflow, root / scope.key / 'automation', controls)
+    # with tabs[4]:
+    #     _evolution(controls)
 
 
 def _render_review(store, index, azure, project, scope, controls):
@@ -440,139 +435,139 @@ def _render_review(store, index, azure, project, scope, controls):
     return workflow
 
 
-def _automation(workflow, root, controls):
-    st.caption('Generated application files live in a separate workspace. Review code before approving local execution.')
-    if not workflow or not workflow['approved']:
-        st.info('Select and approve a manual test workflow first.')
-        return
-    url = st.text_input('Application URL')
-    inspection_text = st.text_area('Page details or observed controls (optional)')
-    inspection_files = sorted(path for path in root.glob('*/reports/inspection.json')
-                              if path.is_file() and path.resolve().is_relative_to(root.resolve())) if root.exists() else []
-    inspection_choice = st.selectbox('Saved browser inspection', [None, *inspection_files],
-                                      format_func=lambda path: path.parent.parent.name if path else 'None')
-    screenshots = st.file_uploader('Application screenshots', type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
-    conventions = st.text_area('Existing framework conventions or selected reusable source')
-    repository = st.text_input('Existing automation repository path (optional)')
-    if st.button('Generate automation proposal'):
-        if repository:
-            from src.agents.framework_evolution import inspect_framework
-            conventions += '\nExisting automation source: ' + json.dumps(inspect_framework(repository))
-        inspection = {'notes': inspection_text}
-        if inspection_choice:
-            inspection['browser_inspection'] = json.loads(inspection_choice.read_text(encoding='utf-8'))
-        proposal = generate_automation(llm_for(controls), workflow, inspection,
-                                       [(f.type, f.getvalue()) for f in screenshots], conventions)
-        st.session_state['engineering_automation_proposal'] = {'workflow': workflow['id'], 'digest': workflow['digest'],
-            'proposal': proposal.model_dump() if hasattr(proposal, 'model_dump') else proposal}
-    saved = st.session_state.get('engineering_automation_proposal', {})
-    proposal = saved.get('proposal')
-    if proposal and saved.get('workflow') == workflow['id'] and saved.get('digest') == workflow['digest']:
-        st.markdown('**Review the proposed automation**')
-        proposal_key = sha256(json.dumps(proposal, sort_keys=True).encode()).hexdigest()[:16]
-        edited = editable_proposal(proposal, f'automation_{workflow["id"]}_{proposal_key}')
-        if st.button('Create isolated automation workspace'):
-            for file in edited['files']:
-                if file['path'].lower().endswith('.json'):
-                    try:
-                        json.loads(file['content'])
-                    except ValueError:
-                        raise ValueError('Generated test data is invalid; regenerate the automation proposal') from None
-            workspace = AutomationWorkspace(root)
-            workspace.write(AutomationProposal.model_validate(edited), workflow)
-            st.session_state['engineering_automation'] = workspace.path.name
-    directories = sorted([p.name for p in root.iterdir() if p.is_dir()]) if root.exists() else []
-    preferred = st.session_state.get('engineering_automation')
-    name = st.selectbox('Automation workspace', directories, index=directories.index(preferred) if preferred in directories else 0) if directories else None
-    if not name:
-        return
-    workspace = AutomationWorkspace(root, name)
-    manifest = json.loads((workspace.path / 'manifest.json').read_text(encoding='utf-8'))
-    if manifest['workflow_id'] != workflow['id'] or manifest['draft_digest'] != workflow['digest']:
-        st.info('This workspace belongs to another manual test revision. Select its approved workflow or generate a new proposal.')
-        return
-    st.caption('Workspace: ' + str(workspace.path))
-    st.write(manifest.get('summary', 'Automation workspace'))
-    for assumption in manifest.get('assumptions', []):
-        st.write('Assumption: ' + assumption)
-    for evidence in manifest.get('locator_evidence', []):
-        st.write('Locator evidence: ' + evidence)
-    for file in sorted(workspace.path.rglob('*')):
-        if (file.is_file() and file.name not in {'manifest.json', 'package.json', 'tsconfig.json', '.approval.json', 'package-lock.json'}
-                and not any(p in {'node_modules', 'reports'} for p in file.relative_to(workspace.path).parts)):
-            with st.expander(file.relative_to(workspace.path).as_posix()):
-                if file.suffix.lower() == '.json':
-                    try:
-                        show_details(json.loads(file.read_text(encoding='utf-8')))
-                    except ValueError:
-                        st.warning('This test data file is invalid.')
-                else:
-                    st.code(file.read_text(encoding='utf-8'))
-    digest = workspace.digest()
-    st.caption('Review digest: ' + digest)
-    if st.button('Approve displayed automation files'):
-        workspace.approve(digest, explicit=True)
-        st.success('Approved. Dependency installation changes the digest; review and approve again afterward.')
-    action = st.selectbox('Controlled action', ['install', 'browsers', 'inspect', 'check', 'validate', 'test', 'check + validate + test'])
-    execute = st.checkbox('I authorize this action on the reviewed code in my controlled local environment', key=f'execute_{name}_{digest}_{action}')
-    if st.button('Run selected action', disabled=not execute):
-        with st.spinner('Running approved action…'):
-            result = workspace.validate_and_test(url, explicit=True) if action == 'check + validate + test' else workspace.run(action, url, explicit=True)
-        for report in result if isinstance(result, list) else [result]:
-            status = 'Passed' if report['returncode'] == 0 else 'Failed'
-            st.write(f"**{report['action'].title()}: {status}**")
-            if report.get('stdout'):
-                with st.expander('Output'):
-                    st.code(report['stdout'], language='text')
-            if report.get('stderr'):
-                with st.expander('Errors'):
-                    st.code(report['stderr'], language='text')
-    for file in sorted((workspace.path / 'reports').glob('*')):
-        if file.suffix.lower() != '.json':
-            st.download_button('Download ' + file.name, file.read_bytes(), file_name=file.name, key=f'download_{name}_{file.name}')
-    if st.button('Analyze execution failures and propose corrections'):
-        reports = [json.loads(f.read_text(encoding='utf-8')) for f in (workspace.path / 'reports').glob('*.json')]
-        st.write(analyze_failures(llm_for(controls), reports))
+# def _automation(workflow, root, controls):
+#     st.caption('Generated application files live in a separate workspace. Review code before approving local execution.')
+#     if not workflow or not workflow['approved']:
+#         st.info('Select and approve a manual test workflow first.')
+#         return
+#     url = st.text_input('Application URL')
+#     inspection_text = st.text_area('Page details or observed controls (optional)')
+#     inspection_files = sorted(path for path in root.glob('*/reports/inspection.json')
+#                               if path.is_file() and path.resolve().is_relative_to(root.resolve())) if root.exists() else []
+#     inspection_choice = st.selectbox('Saved browser inspection', [None, *inspection_files],
+#                                       format_func=lambda path: path.parent.parent.name if path else 'None')
+#     screenshots = st.file_uploader('Application screenshots', type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
+#     conventions = st.text_area('Existing framework conventions or selected reusable source')
+#     repository = st.text_input('Existing automation repository path (optional)')
+#     if st.button('Generate automation proposal'):
+#         if repository:
+#             from src.agents.framework_evolution import inspect_framework
+#             conventions += '\nExisting automation source: ' + json.dumps(inspect_framework(repository))
+#         inspection = {'notes': inspection_text}
+#         if inspection_choice:
+#             inspection['browser_inspection'] = json.loads(inspection_choice.read_text(encoding='utf-8'))
+#         proposal = generate_automation(llm_for(controls), workflow, inspection,
+#                                        [(f.type, f.getvalue()) for f in screenshots], conventions)
+#         st.session_state['engineering_automation_proposal'] = {'workflow': workflow['id'], 'digest': workflow['digest'],
+#             'proposal': proposal.model_dump() if hasattr(proposal, 'model_dump') else proposal}
+#     saved = st.session_state.get('engineering_automation_proposal', {})
+#     proposal = saved.get('proposal')
+#     if proposal and saved.get('workflow') == workflow['id'] and saved.get('digest') == workflow['digest']:
+#         st.markdown('**Review the proposed automation**')
+#         proposal_key = sha256(json.dumps(proposal, sort_keys=True).encode()).hexdigest()[:16]
+#         edited = editable_proposal(proposal, f'automation_{workflow["id"]}_{proposal_key}')
+#         if st.button('Create isolated automation workspace'):
+#             for file in edited['files']:
+#                 if file['path'].lower().endswith('.json'):
+#                     try:
+#                         json.loads(file['content'])
+#                     except ValueError:
+#                         raise ValueError('Generated test data is invalid; regenerate the automation proposal') from None
+#             workspace = AutomationWorkspace(root)
+#             workspace.write(AutomationProposal.model_validate(edited), workflow)
+#             st.session_state['engineering_automation'] = workspace.path.name
+#     directories = sorted([p.name for p in root.iterdir() if p.is_dir()]) if root.exists() else []
+#     preferred = st.session_state.get('engineering_automation')
+#     name = st.selectbox('Automation workspace', directories, index=directories.index(preferred) if preferred in directories else 0) if directories else None
+#     if not name:
+#         return
+#     workspace = AutomationWorkspace(root, name)
+#     manifest = json.loads((workspace.path / 'manifest.json').read_text(encoding='utf-8'))
+#     if manifest['workflow_id'] != workflow['id'] or manifest['draft_digest'] != workflow['digest']:
+#         st.info('This workspace belongs to another manual test revision. Select its approved workflow or generate a new proposal.')
+#         return
+#     st.caption('Workspace: ' + str(workspace.path))
+#     st.write(manifest.get('summary', 'Automation workspace'))
+#     for assumption in manifest.get('assumptions', []):
+#         st.write('Assumption: ' + assumption)
+#     for evidence in manifest.get('locator_evidence', []):
+#         st.write('Locator evidence: ' + evidence)
+#     for file in sorted(workspace.path.rglob('*')):
+#         if (file.is_file() and file.name not in {'manifest.json', 'package.json', 'tsconfig.json', '.approval.json', 'package-lock.json'}
+#                 and not any(p in {'node_modules', 'reports'} for p in file.relative_to(workspace.path).parts)):
+#             with st.expander(file.relative_to(workspace.path).as_posix()):
+#                 if file.suffix.lower() == '.json':
+#                     try:
+#                         show_details(json.loads(file.read_text(encoding='utf-8')))
+#                     except ValueError:
+#                         st.warning('This test data file is invalid.')
+#                 else:
+#                     st.code(file.read_text(encoding='utf-8'))
+#     digest = workspace.digest()
+#     st.caption('Review digest: ' + digest)
+#     if st.button('Approve displayed automation files'):
+#         workspace.approve(digest, explicit=True)
+#         st.success('Approved. Dependency installation changes the digest; review and approve again afterward.')
+#     action = st.selectbox('Controlled action', ['install', 'browsers', 'inspect', 'check', 'validate', 'test', 'check + validate + test'])
+#     execute = st.checkbox('I authorize this action on the reviewed code in my controlled local environment', key=f'execute_{name}_{digest}_{action}')
+#     if st.button('Run selected action', disabled=not execute):
+#         with st.spinner('Running approved action…'):
+#             result = workspace.validate_and_test(url, explicit=True) if action == 'check + validate + test' else workspace.run(action, url, explicit=True)
+#         for report in result if isinstance(result, list) else [result]:
+#             status = 'Passed' if report['returncode'] == 0 else 'Failed'
+#             st.write(f"**{report['action'].title()}: {status}**")
+#             if report.get('stdout'):
+#                 with st.expander('Output'):
+#                     st.code(report['stdout'], language='text')
+#             if report.get('stderr'):
+#                 with st.expander('Errors'):
+#                     st.code(report['stderr'], language='text')
+#     for file in sorted((workspace.path / 'reports').glob('*')):
+#         if file.suffix.lower() != '.json':
+#             st.download_button('Download ' + file.name, file.read_bytes(), file_name=file.name, key=f'download_{name}_{file.name}')
+#     if st.button('Analyze execution failures and propose corrections'):
+#         reports = [json.loads(f.read_text(encoding='utf-8')) for f in (workspace.path / 'reports').glob('*.json')]
+#         st.write(analyze_failures(llm_for(controls), reports))
 
 
-def _evolution(controls):
-    repository = st.text_input('Framework repository path')
-    automation = st.text_area('Generated automation to analyze')
-    reports = st.text_area('Execution report to analyze')
-    if st.button('Propose reusable framework improvements'):
-        proposal = propose_evolution(llm_for(controls), repository, automation, reports)
-        st.session_state['engineering_evolution'] = build_diff(repository, proposal)
-    review = st.session_state.get('engineering_evolution')
-    if not review:
-        return
-    proposal = review['proposal']
-    st.subheader(proposal['title'])
-    st.write(proposal['rationale'])
-    for pattern in proposal.get('existing_patterns', []):
-        st.write('Existing pattern: ' + pattern)
-    for note in proposal.get('regression_notes', []):
-        st.write('Regression note: ' + note)
-    for file in proposal['files']:
-        st.write('Proposed file: ' + file['path'])
-    st.code(review['diff'], language='diff')
-    st.caption('Review digest: ' + review['digest'])
-    branch = st.text_input('New branch', 'ai-evolution/reusable-components')
-    destination = st.text_input('New worktree path (outside repository)')
-    confirm = st.checkbox('I approve this diff and creating a separate review branch')
-    if st.button('Create approved review branch', disabled=not confirm):
-        st.session_state['engineering_evolution_branch'] = create_review_branch(repository, review, review['digest'], branch, destination, explicit=confirm)
-        created = st.session_state['engineering_evolution_branch']
-        st.success(f"Created branch {created['branch']} in {created['worktree']}.")
-    branch_info = st.session_state.get('engineering_evolution_branch')
-    if branch_info and branch_info['digest'] == review['digest']:
-        run = st.checkbox('I approve executing the proposed regression tests')
-        publish = st.checkbox('After passing regressions, I approve committing, pushing and creating a draft pull request')
-        if st.button('Run regression review', disabled=not run):
-            result = regression_and_pr(branch_info['worktree'], review, explicit=run, create_pr=publish)
-            st.write('Regression checks ' + ('passed.' if result['returncode'] == 0 else 'failed.'))
-            if result.get('pull_request'):
-                st.write('Pull request: ' + result['pull_request'])
-            for name in ('stdout', 'stderr'):
-                if result.get(name):
-                    with st.expander('Regression ' + ('output' if name == 'stdout' else 'errors')):
-                        st.code(result[name], language='text')
+# def _evolution(controls):
+#     repository = st.text_input('Framework repository path')
+#     automation = st.text_area('Generated automation to analyze')
+#     reports = st.text_area('Execution report to analyze')
+#     if st.button('Propose reusable framework improvements'):
+#         proposal = propose_evolution(llm_for(controls), repository, automation, reports)
+#         st.session_state['engineering_evolution'] = build_diff(repository, proposal)
+#     review = st.session_state.get('engineering_evolution')
+#     if not review:
+#         return
+#     proposal = review['proposal']
+#     st.subheader(proposal['title'])
+#     st.write(proposal['rationale'])
+#     for pattern in proposal.get('existing_patterns', []):
+#         st.write('Existing pattern: ' + pattern)
+#     for note in proposal.get('regression_notes', []):
+#         st.write('Regression note: ' + note)
+#     for file in proposal['files']:
+#         st.write('Proposed file: ' + file['path'])
+#     st.code(review['diff'], language='diff')
+#     st.caption('Review digest: ' + review['digest'])
+#     branch = st.text_input('New branch', 'ai-evolution/reusable-components')
+#     destination = st.text_input('New worktree path (outside repository)')
+#     confirm = st.checkbox('I approve this diff and creating a separate review branch')
+#     if st.button('Create approved review branch', disabled=not confirm):
+#         st.session_state['engineering_evolution_branch'] = create_review_branch(repository, review, review['digest'], branch, destination, explicit=confirm)
+#         created = st.session_state['engineering_evolution_branch']
+#         st.success(f"Created branch {created['branch']} in {created['worktree']}.")
+#     branch_info = st.session_state.get('engineering_evolution_branch')
+#     if branch_info and branch_info['digest'] == review['digest']:
+#         run = st.checkbox('I approve executing the proposed regression tests')
+#         publish = st.checkbox('After passing regressions, I approve committing, pushing and creating a draft pull request')
+#         if st.button('Run regression review', disabled=not run):
+#             result = regression_and_pr(branch_info['worktree'], review, explicit=run, create_pr=publish)
+#             st.write('Regression checks ' + ('passed.' if result['returncode'] == 0 else 'failed.'))
+#             if result.get('pull_request'):
+#                 st.write('Pull request: ' + result['pull_request'])
+#             for name in ('stdout', 'stderr'):
+#                 if result.get(name):
+#                     with st.expander('Regression ' + ('output' if name == 'stdout' else 'errors')):
+#                         st.code(result[name], language='text')

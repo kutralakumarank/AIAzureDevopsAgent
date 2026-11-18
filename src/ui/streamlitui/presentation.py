@@ -1,7 +1,7 @@
 """Human-readable Streamlit views and editors for test engineering."""
 import copy
-from hashlib import sha256
-import json
+# from hashlib import sha256  # Used by the disabled automation editor.
+# import json  # Used by the disabled automation editor.
 import math
 import re
 from urllib.parse import urlsplit
@@ -96,17 +96,39 @@ def show_evidence(items):
     st.subheader('Related knowledge')
     if not items:
         st.info('No related knowledge is indexed yet.')
-    for item in items:
-        metadata = item.get('metadata', {})
+    # Retrieval returns matching chunks, so group them by their actual source
+    # rather than by title (different documents can have the same title).
+    groups = {}
+    for number, item in enumerate(items):
+        metadata = item.get('metadata') or {}
+        identifier = (metadata.get('source_document_id') or metadata.get('work_item_id')
+                      or metadata.get('source_link'))
+        if identifier is None:
+            key = ('unidentified', item.get('reference_id') or number)
+        else:
+            key = (metadata.get('organization_id'), metadata.get('project_id'),
+                   metadata.get('source_type'), str(identifier))
+        groups.setdefault(key, []).append(item)
+
+    for group in groups.values():
+        metadata = group[0].get('metadata') or {}
         title = metadata.get('title') or 'Untitled source'
         with st.expander(title):
             st.write(f"**Source:** {human_label(metadata.get('source_type', 'unknown'))}")
             if metadata.get('work_item_id'):
                 st.write(f"**Related work item:** {metadata['work_item_id']}")
-            st.write(f"**Why it was retrieved:** {item.get('reason', 'Related to the selected story')}")
-            if item.get('score') is not None:
-                st.caption(f"Relevance score: {item['score']:.4f}")
-            st.write(item.get('content', ''))
+            seen_content = set()
+            for item in group:
+                content = item.get('content', '')
+                if content in seen_content:
+                    continue
+                if seen_content:
+                    st.divider()
+                seen_content.add(content)
+                st.write(f"**Why it was retrieved:** {item.get('reason', 'Related to the selected story')}")
+                if item.get('score') is not None:
+                    st.caption(f"Relevance score: {item['score']:.4f}")
+                st.write(content)
             link = metadata.get('source_link', '')
             if urlsplit(link).scheme in ('http', 'https'):
                 st.link_button('Open source', link)
@@ -137,14 +159,12 @@ def edit_draft(workflow, scope_key):
             title = st.text_input('Title', case['title'], key=prefix + '_title')
             description = st.text_area('Description', case['description'], key=prefix + '_description')
             preconditions = st.text_area('Preconditions (one per line)', '\n'.join(case['preconditions']), key=prefix + '_preconditions')
-            col1, col2, col3 = st.columns(3)
+            col1, col2 = st.columns(2)
             with col1:
                 priority = st.selectbox('Priority', [1, 2, 3, 4], index=[1, 2, 3, 4].index(case['priority']), key=prefix + '_priority')
             with col2:
                 category = st.text_input('Category', case['category'], key=prefix + '_category')
-            with col3:
-                feasibility = st.selectbox('Automation feasibility', ['High', 'Medium', 'Low'],
-                                           index=['High', 'Medium', 'Low'].index(case['automation_feasibility']), key=prefix + '_feasibility')
+            # Preserve the existing automation feasibility value in the backend draft.
             references = st.multiselect('Acceptance criteria covered', list(criteria),
                                         default=case['acceptance_criteria_reference'],
                                         format_func=lambda identifier: f'{identifier}: {criteria[identifier]}', key=prefix + '_criteria')
@@ -167,8 +187,7 @@ def edit_draft(workflow, scope_key):
             case.update(title=title.strip(), description=description.strip(),
                         preconditions=[line.strip() for line in preconditions.splitlines() if line.strip()],
                         steps=steps, priority=priority, category=category.strip(),
-                        acceptance_criteria_reference=references, rag_source_references=related,
-                        automation_feasibility=feasibility)
+                        acceptance_criteria_reference=references, rag_source_references=related)
             if not remove:
                 kept.append(case)
     draft['test_cases'] = kept
@@ -190,49 +209,49 @@ def validate_editor_fields(draft):
             raise ValueError(f'Test case {number} needs at least one step, with an action and expected result for each step.')
 
 
-def edit_test_data(value, key_prefix, label='Test data'):
-    """Edit structured test data as labeled fields while preserving its types."""
-    if isinstance(value, dict):
-        if not value:
-            st.caption(f'{label}: empty')
-        return {key: edit_test_data(item, key_prefix, f'{label} / {key}') for key, item in value.items()}
-    if isinstance(value, list):
-        if not value:
-            st.caption(f'{label}: empty')
-        return [edit_test_data(item, key_prefix, f'{label} / {index + 1}') for index, item in enumerate(value)]
-    key = key_prefix + '_' + sha256(label.encode()).hexdigest()
-    if isinstance(value, bool):
-        return st.checkbox(label, value=value, key=key)
-    if isinstance(value, int):
-        return st.number_input(label, value=value, step=1, key=key)
-    if isinstance(value, float):
-        return st.number_input(label, value=value, key=key)
-    if value is None:
-        result = st.text_input(label, value='', key=key)
-        return result if result else None
-    if '\n' in str(value):
-        return st.text_area(label, value=str(value), key=key)
-    return st.text_input(label, value=str(value), key=key)
+# def edit_test_data(value, key_prefix, label='Test data'):
+#     """Edit structured test data as labeled fields while preserving its types."""
+#     if isinstance(value, dict):
+#         if not value:
+#             st.caption(f'{label}: empty')
+#         return {key: edit_test_data(item, key_prefix, f'{label} / {key}') for key, item in value.items()}
+#     if isinstance(value, list):
+#         if not value:
+#             st.caption(f'{label}: empty')
+#         return [edit_test_data(item, key_prefix, f'{label} / {index + 1}') for index, item in enumerate(value)]
+#     key = key_prefix + '_' + sha256(label.encode()).hexdigest()
+#     if isinstance(value, bool):
+#         return st.checkbox(label, value=value, key=key)
+#     if isinstance(value, int):
+#         return st.number_input(label, value=value, step=1, key=key)
+#     if isinstance(value, float):
+#         return st.number_input(label, value=value, key=key)
+#     if value is None:
+#         result = st.text_input(label, value='', key=key)
+#         return result if result else None
+#     if '\n' in str(value):
+#         return st.text_area(label, value=str(value), key=key)
+#     return st.text_input(label, value=str(value), key=key)
 
 
-def editable_proposal(proposal, key_prefix):
-    """Review generated files as code or structured fields, with JSON kept internal."""
-    result = copy.deepcopy(proposal)
-    result['summary'] = st.text_area('Automation summary', result['summary'], key=key_prefix + '_summary')
-    for name, label in [('assumptions', 'Assumptions'), ('locator_evidence', 'Locator evidence')]:
-        lines = st.text_area(label + ' (one per line)', '\n'.join(result[name]), key=key_prefix + '_' + name)
-        result[name] = [line.strip() for line in lines.splitlines() if line.strip()]
-    for number, file in enumerate(result['files']):
-        with st.expander(file['path']):
-            if file['path'].lower().endswith('.json'):
-                try:
-                    data = json.loads(file['content'])
-                except ValueError:
-                    st.error('The generated test data is invalid. Generate the proposal again.')
-                    continue
-                st.caption('Generated test data')
-                edited = edit_test_data(data, f'{key_prefix}_data_{number}')
-                file['content'] = json.dumps(edited, indent=2)
-            else:
-                file['content'] = st.text_area('File content', file['content'], height=240, key=f'{key_prefix}_file_{number}')
-    return result
+# def editable_proposal(proposal, key_prefix):
+#     """Review generated files as code or structured fields, with JSON kept internal."""
+#     result = copy.deepcopy(proposal)
+#     result['summary'] = st.text_area('Automation summary', result['summary'], key=key_prefix + '_summary')
+#     for name, label in [('assumptions', 'Assumptions'), ('locator_evidence', 'Locator evidence')]:
+#         lines = st.text_area(label + ' (one per line)', '\n'.join(result[name]), key=key_prefix + '_' + name)
+#         result[name] = [line.strip() for line in lines.splitlines() if line.strip()]
+#     for number, file in enumerate(result['files']):
+#         with st.expander(file['path']):
+#             if file['path'].lower().endswith('.json'):
+#                 try:
+#                     data = json.loads(file['content'])
+#                 except ValueError:
+#                     st.error('The generated test data is invalid. Generate the proposal again.')
+#                     continue
+#                 st.caption('Generated test data')
+#                 edited = edit_test_data(data, f'{key_prefix}_data_{number}')
+#                 file['content'] = json.dumps(edited, indent=2)
+#             else:
+#                 file['content'] = st.text_area('File content', file['content'], height=240, key=f'{key_prefix}_file_{number}')
+#     return result

@@ -1,10 +1,10 @@
 """Durable immutable revisions; changing a draft invalidates its approval."""
 from hashlib import sha256
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
-import sqlite3
 from uuid import uuid4
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -12,6 +12,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from src.test_engineering.knowledge import plain
 from src.test_engineering.models import TestDraft
 from src.LLMS.structured import invoke_structured
+from src.test_engineering.storage import file_lock, atomic_write
 
 
 def criteria_for(story):
@@ -82,29 +83,36 @@ def regenerate_selected(llm, story, context, draft, selected_titles, instruction
 
 
 class WorkflowStore:
+    """Keep revisions and publication journal in an atomic, locked JSON file."""
+
     def __init__(self, root, scope):
         self.scope = scope
         directory = Path(root) / scope.key
         directory.mkdir(parents=True, exist_ok=True)
-        self.path = directory / 'workflow.sqlite3'
-        with self.connect() as db:
-            db.executescript('''
-                CREATE TABLE IF NOT EXISTS workflows (id TEXT PRIMARY KEY, current_revision INTEGER);
-                CREATE TABLE IF NOT EXISTS revisions (workflow TEXT, revision INTEGER, payload TEXT,
-                    digest TEXT, approved INTEGER DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY(workflow, revision));
-                CREATE TABLE IF NOT EXISTS publications (fingerprint TEXT PRIMARY KEY,
-                    case_id INTEGER, status TEXT, updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
-            ''')
+        self.path = directory / 'workflow.json'
+        self.lock_path = directory / 'workflow.lock'
+
+    def _read(self):
+        if not self.path.exists():
+            return {'format': 1, 'workflows': {}, 'order': [], 'publications': {}}
+        try:
+            state = json.loads(self.path.read_text(encoding='utf-8'))
+            if (state['format'] != 1 or not isinstance(state['workflows'], dict)
+                    or not isinstance(state['order'], list) or not isinstance(state['publications'], dict)):
+                raise ValueError
+            return state
+        except (OSError, ValueError, KeyError, TypeError):
+            raise ValueError('Workflow storage is invalid. Restore a backup before continuing.') from None
+
+    def _write(self, state):
+        atomic_write(self.path, json.dumps(state, ensure_ascii=False, sort_keys=True).encode('utf-8'))
 
     @contextmanager
-    def connect(self):
-        connection = sqlite3.connect(self.path, timeout=30)
-        try:
-            with connection:
-                yield connection
-        finally:
-            connection.close()
+    def transaction(self):
+        with file_lock(self.lock_path):
+            state = self._read()
+            yield state
+            self._write(state)
 
     def save(self, story, context, draft, workflow_id=None, *, expected_revision=None):
         for item in context:
@@ -114,49 +122,55 @@ class WorkflowStore:
                 raise PermissionError('Workflow evidence is outside the permitted project and sources')
         draft = validate_draft(draft, story, context)
         identifier = workflow_id or str(uuid4())
-        payload = json.dumps({'story': story, 'context': context, 'draft': draft.model_dump()}, sort_keys=True)
-        digest = sha256(payload.encode()).hexdigest()
-        with self.connect() as db:
-            db.execute('BEGIN IMMEDIATE')
-            row = db.execute('SELECT current_revision FROM workflows WHERE id=?', (identifier,)).fetchone()
-            if expected_revision is not None and (not row or row[0] != expected_revision):
+        payload = {'story': story, 'context': context, 'draft': draft.model_dump()}
+        digest = sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        with self.transaction() as state:
+            existing = state['workflows'].get(identifier)
+            if expected_revision is not None and (not existing or existing['current_revision'] != expected_revision):
                 raise ValueError('Draft changed since it was opened; reload it before saving')
-            revision = row[0] + 1 if row else 1
-            db.execute('INSERT INTO revisions(workflow,revision,payload,digest) VALUES (?,?,?,?)',
-                       (identifier, revision, payload, digest))
-            db.execute('INSERT OR REPLACE INTO workflows VALUES (?,?)', (identifier, revision))
+            revision = existing['current_revision'] + 1 if existing else 1
+            if not existing:
+                existing = {'current_revision': 0, 'revisions': {}}
+                state['workflows'][identifier] = existing
+            existing['revisions'][str(revision)] = {'payload': payload, 'digest': digest, 'approved': False,
+                                                    'created_at': datetime.now(timezone.utc).isoformat()}
+            existing['current_revision'] = revision
+            if identifier in state['order']:
+                state['order'].remove(identifier)
+            state['order'].append(identifier)
         return identifier
 
     def load(self, identifier):
-        with self.connect() as db:
-            row = db.execute('SELECT r.revision,r.payload,r.digest,r.approved FROM revisions r JOIN workflows w '
-                             'ON w.id=r.workflow AND w.current_revision=r.revision WHERE w.id=?', (identifier,)).fetchone()
-        if not row:
+        state = self._read()
+        workflow = state['workflows'].get(identifier)
+        if not workflow:
             raise ValueError('Workflow not found in this project')
-        payload = json.loads(row[1])
+        revision = workflow['current_revision']
+        record = workflow['revisions'][str(revision)]
+        payload = record['payload']
         if any(item['metadata'].get('source_type') not in self.scope.sources for item in payload['context']):
             raise PermissionError('This workflow contains a source no longer permitted; generate a fresh draft')
-        return {'id': identifier, 'revision': row[0], **payload, 'digest': row[2], 'approved': bool(row[3])}
+        return {'id': identifier, 'revision': revision, **payload, 'digest': record['digest'], 'approved': bool(record['approved'])}
 
     def list(self):
-        with self.connect() as db:
-            return [row[0] for row in db.execute('SELECT id FROM workflows ORDER BY rowid DESC')]
+        return list(reversed(self._read()['order']))
 
     def history(self, identifier):
-        with self.connect() as db:
-            return [{'revision': r, 'digest': d, 'approved': bool(a), 'created_at': t}
-                    for r, d, a, t in db.execute('SELECT revision,digest,approved,created_at FROM revisions WHERE workflow=? ORDER BY revision', (identifier,))]
+        workflow = self._read()['workflows'].get(identifier)
+        if not workflow:
+            return []
+        return [{'revision': int(revision), 'digest': value['digest'], 'approved': bool(value['approved']),
+                 'created_at': value['created_at']}
+                for revision, value in sorted(workflow['revisions'].items(), key=lambda item: int(item[0]))]
 
     def approve(self, identifier, revision, digest, *, explicit=False):
         if not explicit:
             raise PermissionError('Explicit human approval is required')
-        with self.connect() as db:
-            db.execute('BEGIN IMMEDIATE')
-            current = db.execute('SELECT current_revision FROM workflows WHERE id=?', (identifier,)).fetchone()
-            if not current or current[0] != revision:
+        with self.transaction() as state:
+            workflow = state['workflows'].get(identifier)
+            if not workflow or workflow['current_revision'] != revision:
                 raise ValueError('Draft changed; review the current revision')
-            cursor = db.execute('UPDATE revisions SET approved=1 WHERE workflow=? AND revision=? AND digest=?',
-                                (identifier, revision, digest))
-            if cursor.rowcount != 1:
+            record = workflow['revisions'][str(revision)]
+            if record['digest'] != digest:
                 raise ValueError('Draft digest changed')
-
+            record['approved'] = True
