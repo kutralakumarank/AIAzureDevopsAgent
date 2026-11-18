@@ -10,12 +10,11 @@ from pydantic import SecretStr
 from pydantic import ValidationError
 
 from src.integrations.azure_devops import AzureDevOps
-from src.integrations.confluence import Confluence
 from src.LLMS.groqllm import GroqLLM
 from src.LLMS.ollamallm import list_ollama_models, ollama_llm
 from src.LLMS.provider_errors import provider_error_message
 from src.RAG.Rag import Rag
-from src.test_engineering.knowledge import Scope, KnowledgeIndex, story_document, confluence_documents, file_documents
+from src.test_engineering.knowledge import Scope, KnowledgeIndex, story_document, file_documents
 from src.test_engineering.workflow import WorkflowStore, generate_tests, regenerate_selected, criteria_for, validate_draft
 from src.test_engineering.publishing import Publisher, approve_review, approve_and_publish
 # Automation and framework evolution are disabled in the UI.
@@ -113,7 +112,7 @@ def ensure_indexed(index, document, attempt_key, label):
 def render():
     st.set_page_config(page_title='AI Test Engineering', layout='wide')
     st.title('AI Test Engineering')
-    st.caption('LangChain RAG · Azure DevOps · Confluence · manual test engineering')
+    st.caption('LangChain RAG · Azure DevOps · manual test engineering')
     try:
         _render()
     except Exception as error:
@@ -263,19 +262,6 @@ def _render():
             ids = azure.query_ids(project['name'])
             history = azure.work_items(project['id'], ids)
             show_sync(index.sync([story_document(s, scope) for s in history], 'azure_devops', full_snapshot=True, force=force), 'Azure DevOps history')
-        with st.expander('Confluence Cloud ingestion'):
-            site = st.text_input('Confluence site URL')
-            email = st.text_input('Confluence email')
-            token = st.text_input('Confluence API token', type='password', key='engineering_confluence_token')
-            space = st.text_input('Space ID (optional; blank syncs all accessible pages)')
-            if st.button('Sync Confluence pages'):
-                connector = Confluence(site, email, SecretStr(token))
-                try:
-                    # Space-specific batches are incremental to avoid deleting other indexed spaces.
-                    show_sync(index.sync(confluence_documents(connector, scope, space or None), 'confluence',
-                                         full_snapshot=not bool(space), partition=connector.http.base, force=force), 'Confluence pages')
-                finally:
-                    connector.close()
         uploads = st.file_uploader('Add business documents',
                                    type=['pdf', 'docx', 'xlsx', 'csv', 'txt', 'md', 'ts', 'js', 'py', 'feature', 'json'],
                                    accept_multiple_files=True)

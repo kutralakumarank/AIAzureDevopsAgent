@@ -80,6 +80,8 @@ model_controls()
             self.assertFalse(app.exception)
             self.assertFalse(app.error)
             self.assertEqual([tab.label for tab in app.tabs], ['Stories', 'Knowledge', 'Review and publish'])
+            self.assertFalse(any(item.label == 'Confluence Cloud ingestion' for item in app.expander))
+            self.assertFalse(any(item.label == 'Sync Confluence pages' for item in app.button))
             self.assertFalse(any('Discover other accessible organizations' in button.label for button in app.button))
 
     def test_connect_uses_streamlit_credentials_instead_of_environment(self):

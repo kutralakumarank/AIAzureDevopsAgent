@@ -20,7 +20,6 @@ their backend modules remain in the repository.
 - A Groq API key, or a running local Ollama service with a model installed.
 - An embedding provider and credentials. **See the setup issue below before
   attempting to index stories or documents.**
-- Optional: Confluence Cloud access and an API token for Confluence ingestion.
 
 ### Current embedding setup issue
 
@@ -131,8 +130,6 @@ error and use the displayed retry control.
 The **Knowledge** tab displays source synchronization status and offers:
 
 - **Sync project history (full snapshot)** for accessible Azure work items.
-- **Confluence Cloud ingestion**, using a site URL, email, token, and optional
-  space ID.
 - **Add business documents** for multiple PDFs, DOCX, XLSX, CSV, text,
   Markdown, and supported source files. The optional document parsers must be
   installed for PDF, DOCX, and XLSX.
@@ -141,7 +138,8 @@ Uploads are indexed automatically. A changed file with the same name replaces
 its earlier indexed version; upload different names for distinct documents.
 Unchanged documents are skipped. A successful full snapshot can remove
 documents absent from the snapshot; a failed fetch preserves the prior index.
-Space-specific Confluence synchronization is incremental.
+Previously indexed Confluence content remains available when its source is allowed.
+The interface no longer offers Confluence synchronization.
 
 The index is scoped by authenticated identity, organization, project, and
 allowed sources. The local directory contains persisted FAISS vector files and
@@ -206,7 +204,6 @@ flowchart LR
 
     subgraph Sources["External sources"]
         Azure["Azure DevOps work items"]
-        Confluence["Confluence Cloud pages"]
         Files["Uploaded documents"]
     end
 
@@ -238,10 +235,8 @@ flowchart LR
     end
 
     Stories -->|"read stories"| Azure
-    Knowledge -->|"sync pages"| Confluence
     Knowledge -->|"upload"| Files
     Azure --> Ingest
-    Confluence --> Ingest
     Files --> Ingest
     Stories -->|"selected requirements"| Generate
     Search -->|"related evidence"| Generate
@@ -256,7 +251,7 @@ before ingestion and retrieval can run against the configured provider.
 | --- | --- |
 | `app.py`, `src/main.py` | Streamlit entry point and environment loading. |
 | `src/ui/streamlitui/` | Connection, readable views, knowledge, and test review. |
-| `src/integrations/` | Azure DevOps, Confluence, and HTTP clients. |
+| `src/integrations/` | Azure DevOps and HTTP clients, plus the retained Confluence connector. |
 | `src/RAG/Rag.py` | Shared text splitter and embedding factory. |
 | `src/test_engineering/knowledge.py` | Source ingestion, FAISS vector storage, JSON metadata, and retrieval. |
 | `src/test_engineering/workflow.py` | Generation, validation, revisions, and review storage. |
