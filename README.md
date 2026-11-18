@@ -1,282 +1,319 @@
 # AI Test Engineering
 
-A Streamlit application that reads Azure DevOps work items, retrieves related
-project knowledge, generates manual test cases with a language model, and
-uploads reviewed cases to Azure Test Plans. It uses LangChain for generation
-and retrieval, FAISS for knowledge vectors, and JSON for document metadata,
-review history, and publication records.
+AI Test Engineering is a Streamlit application for generating and reviewing
+manual test cases from Azure DevOps work items. It uses retrieval-augmented
+generation (RAG): the selected story and relevant project knowledge are passed
+to a Groq or local Ollama model, and the resulting test cases are reviewed
+before they are uploaded to Azure Test Plans.
 
-The active interface contains **Stories**, **Knowledge**, and **Review and
-publish**. Automation and Framework Evolution controls are disabled in the UI;
-their backend modules remain in the repository.
+The active interface has three tabs: **Stories**, **Knowledge**, and **Review
+and publish**. Knowledge vectors are stored in FAISS; document metadata,
+review revisions, and publication records are stored in JSON files. The
+application does not use SQLite.
 
-## Requirements
+## What the application does
 
-- Windows, macOS, or Linux with Python 3.14 and [uv](https://docs.astral.sh/uv/).
-- An Azure DevOps organization, accessible project, and PAT with access to the
-  work items and Test Plans you intend to use. The required permissions depend
-  on your organization's policies and on whether you create plans, suites, or
-  test cases.
-- A Groq API key, or a running local Ollama service with a model installed.
-- An embedding provider and credentials. **See the setup issue below before
-  attempting to index stories or documents.**
+- Connects to Azure DevOps using an organization URL and a personal access
+  token (PAT) entered in the UI.
+- Lists accessible projects, teams, sprints, and work items by name.
+- Adds retrieved stories and uploaded documents to project-scoped knowledge.
+- Searches the FAISS index for related passages and groups results by source.
+- Generates manual test cases using Groq or a locally installed Ollama model.
+- Lets a reviewer edit, add, remove, regenerate, and approve cases.
+- Publishes approved cases to a selected Azure Test Plan and Test Suite.
 
-### Current embedding setup issue
-
-The current [`Rag.create_embeddings`](src/RAG/Rag.py) implementation imports
-`langchain_google_genai` and selects `gemini-embedding-2-preview`. However,
-`langchain-google-genai` is not declared in the project dependencies, and the
-example environment file still describes Hugging Face. A fresh installation
-therefore cannot create the configured embeddings until this mismatch is fixed.
-Hugging Face settings in `.env.example` do not configure the current Google
-embedding client.
-
-To use the current Google implementation, add the integration to the project
-and configure Google credentials according to the [LangChain Google embedding
-documentation](https://docs.langchain.com/oss/python/integrations/text_embedding/google_generative_ai).
-For example, from the project directory:
-
-```powershell
-uv add langchain-google-genai
-```
-
-Set `GOOGLE_API_KEY` in your local `.env`, and confirm that your account can use
-the configured model. Adding the dependency changes `pyproject.toml` and
-`uv.lock`. No live Google embedding request has been verified for this project.
-If an index was created using another embedding model, follow the re-indexing
-instructions below before using it. Choosing Ollama for generation does not
-change the embedding provider.
-
-## Installation and startup
-
-Open PowerShell in the project directory:
-
-```powershell
-uv sync --locked --extra documents
-if (-not (Test-Path .env)) { Copy-Item .env.example .env }
-uv run streamlit run app.py --server.address 127.0.0.1
-```
-
-The `documents` extra installs the PDF, Word, and Excel parsers. The other
-supported text and source-file formats do not require this extra. Open the
-local address printed by Streamlit. Stop the server with `Ctrl+C`.
-
-The application is designed for a trusted local, single-user environment.
-The local data directory can contain requirements, retrieved documents,
-generated tests, and vectors; protect it accordingly. `.env` and `.local/` are
-excluded by `.gitignore`. Never commit real keys, tokens, or sensitive data.
-
-## Configuration
-
-Azure credentials are entered in the **Connect Azure DevOps** form, not read
-from `.env`. Enter an organization URL such as
-`https://dev.azure.com/your-organization` and a PAT. The PAT input is masked,
-and the form is cleared after submission. **Disconnect** ends the current
-session and clears its application state.
-
-Other settings can be supplied in `.env`:
-
-| Setting | Purpose |
-| --- | --- |
-| `AZURE_DEVOPS_API_VERSION` | Optional Azure REST API version; default `7.1`. |
-| `GROQ_API_KEY` | Optional Groq key fallback; a key entered in the UI takes precedence. |
-| `GOOGLE_API_KEY` | Google embedding credential when the current Google integration is installed and configured. |
-| `OLLAMA_BASE_URL` | Local Ollama URL; defaults to `http://127.0.0.1:11434`. Only loopback hosts are accepted. |
-| `ENGINEERING_DATA_DIR` | Local root for knowledge and review data; defaults to `.local/test-engineering`. |
-| `ENGINEERING_EMBEDDING_VERSION` | Version label used to detect embedding changes. It does not select the model. |
-| `ENGINEERING_ALLOWED_SOURCES` | Comma-separated allowed sources; defaults to `azure_devops,confluence,files,approved_tests`. |
-| `HUGGINGFACEHUB_API_TOKEN` | Present in the example from an earlier embedding setup; the current embedding implementation does not use it. |
-
-The default embedding version label still names the former Hugging Face model.
-When adopting or changing an embedding model, set this label to a new, unique
-value that identifies the actual implementation and re-index every required
-source. Avoid mixing vectors produced by different models.
-
-## Choose a generation model
-
-After connecting and choosing a project, select an **LLM provider**:
-
-- **Groq:** select a configured model and enter the Groq API key in the masked
-  field. The UI key is used first; `GROQ_API_KEY` is a fallback.
-- **Ollama:** start Ollama locally, install a suitable model with a command
-  such as `ollama pull llama3.2`, and click **Refresh local models**. Choose
-  an installed model from the list. The app does not pull models automatically.
-
-Use a model that can reliably follow the structured test-case schema. Model
-quality, context limits, and response time vary. Model selection affects test
-generation; document embeddings are configured separately.
-
-## Workflow
-
-### 1. Connect and choose a story
-
-1. Expand **Connect Azure DevOps**, enter the organization URL and PAT, and
-   click **Connect and validate access**.
-2. Select a project, generation provider and model, then choose a team and
-   sprint. The dropdowns display names while retaining the IDs needed by Azure.
-3. Adjust the comma-separated work-item types if your project uses custom
-   types. Click **Retrieve sprint work items**, search by ID or title, and
-   select a story.
-4. Review the displayed requirements and acceptance criteria. Discussion
-   history can be loaded on request. New or changed retrieved stories are
-   indexed automatically when the embedding service is available.
-
-The application saves the selected story and retrieves related knowledge
-before enabling generation. If saving or retrieval fails, resolve the provider
-error and use the displayed retry control.
-
-### 2. Add project knowledge
-
-The **Knowledge** tab displays source synchronization status and offers:
-
-- **Sync project history (full snapshot)** for accessible Azure work items.
-- **Add business documents** for multiple PDFs, DOCX, XLSX, CSV, text,
-  Markdown, and supported source files. The optional document parsers must be
-  installed for PDF, DOCX, and XLSX.
-
-Uploads are indexed automatically. A changed file with the same name replaces
-its earlier indexed version; upload different names for distinct documents.
-Unchanged documents are skipped. A successful full snapshot can remove
-documents absent from the snapshot; a failed fetch preserves the prior index.
-Previously indexed Confluence content remains available when its source is allowed.
-The interface no longer offers Confluence synchronization.
-
-The index is scoped by authenticated identity, organization, project, and
-allowed sources. The local directory contains persisted FAISS vector files and
-`knowledge.json` with document text, source metadata, and synchronization
-status. Search uses the FAISS index. The app separately retains workflow
-revisions and publication records in `workflow.json`.
-Changing `ENGINEERING_DATA_DIR` changes where this data is stored. Back up the
-entire project data directory, including both FAISS files and JSON metadata.
-
-Knowledge reads and writes use FAISS and JSON. FAISS vector shards from older
-updates are retained; they can increase disk usage.
-
-When changing the embedding model or its dimensions, change
-`ENGINEERING_EMBEDDING_VERSION` and re-index every relevant source, including
-uploaded files and approved tests as applicable. Do not assume a partial sync
-migrates all existing vectors. **Force re-index** can be used when deliberately
-rebuilding synchronized sources.
-
-### 3. Generate and review manual tests
-
-On **Stories**, inspect the related knowledge and click **Generate manual test
-cases**. The generated draft is validated and saved as a reviewable revision.
-Open **Review and publish** to edit titles, descriptions, preconditions,
-priorities, categories, references, and the test-step table. You can add or
-remove cases, regenerate selected cases with instructions, and inspect revision
-history. JSON processing remains in the backend.
-
-Validation checks the schema, step numbering, story ID, references, duplicate
-titles, and acceptance-criteria coverage. These checks do not establish that
-the cases are correct or complete: review the steps, assumptions, test data,
-and expected results before approval.
-
-### 4. Approve and publish
-
-Enter a **Test Plan ID** and **Test Suite ID**, or expand **Find or create a
-test plan and suite** to load available items or create them. Click
-**OK - approve and upload** to save the displayed edits, approve that revision,
-and publish the cases to the selected Azure project, plan, and suite. The page
-shows the created IDs and results.
-
-**Approve without uploading** saves approval separately. You may add an approved
-case set to project knowledge. Publication checks the target and the story
-revision; a changed story requires a fresh review. A local journal and remote
-fingerprints support retry after partial failures, but they are not a substitute
-for verifying the results in Azure DevOps.
+Automation and Framework Evolution screens are disabled. Confluence ingestion
+is not offered in the UI. The repository still contains backend code and
+historical documentation for features outside the active interface.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     User([Test engineer]) --> UI
-
-    subgraph Interface["Streamlit interface"]
-        UI["Connect and select project"]
-        Stories["Stories: select requirements"]
-        Knowledge["Knowledge: synchronize sources"]
-        Review["Review and edit manual tests"]
-        UI --> Stories
-        UI --> Knowledge
+    subgraph UI["Streamlit interface"]
+        Connect["Connect to Azure DevOps"]
+        Stories["Stories"]
+        Knowledge["Knowledge"]
+        Review["Review and publish"]
+        Connect --> Stories
+        Connect --> Knowledge
         Stories --> Review
     end
 
-    subgraph Sources["External sources"]
+    subgraph Sources["Knowledge sources"]
         Azure["Azure DevOps work items"]
         Files["Uploaded documents"]
     end
 
-    subgraph RAG["Knowledge and retrieval"]
-        Ingest["Normalize and split documents"]
+    subgraph RAG["RAG knowledge storage"]
+        Split["Extract and split text"]
         Embed["Embedding model"]
-        Store[("FAISS vectors and JSON metadata")]
-        FAISS[("Persistent FAISS index")]
+        Vectors[("FAISS vectors and index")]
+        Metadata[("JSON text and metadata")]
         Search["Project-scoped retrieval"]
-        Ingest --> Embed --> Store
-        Store --> FAISS --> Search
+        Split --> Embed --> Vectors
+        Split --> Metadata
+        Vectors --> Search
+        Metadata --> Search
         Embed --> Search
     end
 
     subgraph Generation["Test generation"]
-        Generate["Generate and validate test cases"]
-        Groq["Groq model"]
-        Ollama["Local Ollama model"]
-        Generate -->|"selected provider"| Groq
-        Generate -->|"selected provider"| Ollama
+        Generator["Generate and validate cases"]
+        Groq["Groq"]
+        Ollama["Local Ollama"]
+        Generator -->|"selected provider"| Groq
+        Generator -->|"selected provider"| Ollama
     end
 
     subgraph Delivery["Review and delivery"]
-        Revisions[("JSON review history")]
-        Publish["Approve and publish"]
-        Plans["Azure Test Plans and suites"]
-        Review --> Revisions
+        History[("JSON revisions and publication journal")]
+        Publish["Approve and upload"]
+        Plans["Azure Test Plans"]
+        Review --> History
         Review --> Publish --> Plans
     end
 
-    Stories -->|"read stories"| Azure
+    Stories -->|"read"| Azure
     Knowledge -->|"upload"| Files
-    Azure --> Ingest
-    Files --> Ingest
-    Stories -->|"selected requirements"| Generate
-    Search -->|"related evidence"| Generate
-    Generate -->|"validated draft"| Review
+    Azure --> Split
+    Files --> Split
+    Stories -->|"current requirements"| Generator
+    Search -->|"related passages"| Generator
+    Generator -->|"validated draft"| Review
 ```
 
-The selected generation model and the embedding model are separate services.
-The current embedding dependency mismatch described above must be resolved
-before ingestion and retrieval can run against the configured provider.
+The embedding model used by the knowledge index is separate from the Groq or
+Ollama model used for test generation. Selecting Ollama does not make the
+embedding service local.
 
-| Path | Responsibility |
+## Requirements
+
+- Python 3.14 and [uv](https://docs.astral.sh/uv/).
+- An Azure DevOps organization and a PAT with access to the desired project,
+  work items, plans, and suites. Creating plans or test cases requires the
+  corresponding Azure permissions.
+- A Groq API key or a running local Ollama service with a model installed.
+- Access to the configured embedding model. See the setup issue below.
+- The optional `documents` extra to read PDF, Word, and Excel files.
+
+### Embedding setup issue
+
+The current [embedding factory](src/RAG/Rag.py) imports
+`langchain_google_genai` and requests the `gemini-embedding-2-preview` model.
+However, `langchain-google-genai` is not declared in `pyproject.toml`, and
+`.env.example` still lists a Hugging Face token. A fresh installation therefore
+needs an additional dependency and Google credentials before it can index or
+retrieve knowledge with the current factory. The Hugging Face token does not
+configure this Google client.
+
+To use the existing Google implementation, add the integration after the
+initial dependency sync:
+
+```powershell
+uv add langchain-google-genai
+```
+
+This command updates `pyproject.toml` and `uv.lock`. Add a `GOOGLE_API_KEY`
+entry to your local `.env`, and verify your account can use the configured
+model. See [LangChain's Google embeddings setup](https://docs.langchain.com/oss/python/integrations/embeddings/google_generative_ai)
+for provider configuration. Live model access has not been verified by the
+offline tests.
+
+The default `ENGINEERING_EMBEDDING_VERSION` label still names the older
+EmbeddingGemma configuration. The label tracks index compatibility; it does not
+choose the embedding model. If changing the embedding implementation, assign a
+new unique label and re-index every relevant source before retrieval.
+
+## Install and run
+
+In PowerShell, open the project directory and run:
+
+```powershell
+uv sync --locked --extra documents
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+```
+
+Resolve the embedding setup issue above and configure your local credentials.
+Then start the application:
+
+```powershell
+uv run streamlit run app.py --server.address 127.0.0.1
+```
+
+Open the local URL printed by Streamlit. Use `Ctrl+C` in the terminal to stop
+the server. If you change dependencies or environment settings, restart it.
+
+## Configuration
+
+Enter the Azure organization URL and PAT in **Connect Azure DevOps** each time
+you connect. The PAT field is masked, and the form clears after submission.
+Azure URL and PAT values are not read from `.env` by the connection form.
+
+Other settings can be supplied through `.env` or the process environment:
+
+| Setting | Purpose |
 | --- | --- |
-| `app.py`, `src/main.py` | Streamlit entry point and environment loading. |
-| `src/ui/streamlitui/` | Connection, readable views, knowledge, and test review. |
-| `src/integrations/` | Azure DevOps and HTTP clients, plus the retained Confluence connector. |
-| `src/RAG/Rag.py` | Shared text splitter and embedding factory. |
-| `src/test_engineering/knowledge.py` | Source ingestion, FAISS vector storage, JSON metadata, and retrieval. |
-| `src/test_engineering/workflow.py` | Generation, validation, revisions, and review storage. |
-| `src/test_engineering/publishing.py` | Approval and Azure Test Plans publishing. |
-| `src/LLMS/` | Groq, Ollama, structured output, and provider error handling. |
-| `src/automation/`, `src/agents/framework_evolution.py` | Retained backend code; automation and evolution UI is disabled. |
+| `AZURE_DEVOPS_API_VERSION` | Optional Azure REST version; defaults to `7.1`. |
+| `GROQ_API_KEY` | Optional Groq fallback if the UI key is blank. |
+| `GOOGLE_API_KEY` | Google embedding credential for the current embedding factory after installing its integration. Add it to `.env` yourself; it is not in the current example file. |
+| `OLLAMA_BASE_URL` | Local Ollama address; defaults to `http://127.0.0.1:11434`. Only loopback hosts are accepted. |
+| `ENGINEERING_DATA_DIR` | Local storage root; defaults to `.local/test-engineering`. |
+| `ENGINEERING_EMBEDDING_VERSION` | Version label used to detect incompatible stored embeddings. |
+| `ENGINEERING_ALLOWED_SOURCES` | Comma-separated source types allowed for retrieval. The code default is `azure_devops,confluence,files,approved_tests`; the active UI does not ingest Confluence pages. |
+| `HUGGINGFACEHUB_API_TOKEN` | Present in the example for an older embedding configuration; not used by the current Google embedding factory. |
+
+The `.env` file and `.local` directory are ignored by Git. Do not commit API
+keys, PATs, or local project data.
+
+## Choose a generation model
+
+After connecting and choosing a project, select an **LLM provider**:
+
+### Groq
+
+1. Select **Groq** and choose a model from the list.
+2. Enter a key in the masked **Groq API key** field, or configure the
+   `GROQ_API_KEY` fallback in `.env`.
+
+The configured model list is in `src/ui/uiconfigfile.ini`. Model availability
+and structured-output quality depend on the provider and your account.
+
+### Ollama
+
+1. Start the local Ollama service.
+2. Install a model, for example `ollama pull llama3.2`.
+3. Select **Ollama**, click **Refresh local models**, and choose an installed
+   model. The application does not download models automatically.
+
+Use a model that can follow the requested structured test-case schema. Local
+model quality and speed depend on the model and available hardware.
+
+## Use the application
+
+### 1. Connect and select a story
+
+1. Expand **Connect Azure DevOps** and enter the organization URL, for example
+   `https://dev.azure.com/your-organization`, and your PAT. Click **Connect and
+   validate access**.
+2. Select a project and generation model, then choose a team and sprint. The
+   selectors show names; Azure IDs are retained internally.
+3. Adjust the work-item types if needed and click **Retrieve sprint work items**.
+   Search by ID or title and select a story.
+4. Read its description and acceptance criteria. Use **Load discussion
+   history** if comments are needed.
+
+Retrieved work items are added or updated in knowledge when the embedding
+service is available. Selecting a story also saves its current revision.
+Unchanged content is not re-embedded. If saving or retrieval fails, resolve the
+provider problem and use the displayed retry control.
+
+### 2. Add project knowledge
+
+In **Knowledge**:
+
+- Use **Sync project history (full snapshot)** to index accessible Azure work
+  items. A successful full snapshot can remove items no longer present in that
+  snapshot; a failed fetch preserves the prior knowledge.
+- Use **Add business documents** to upload multiple PDF, DOCX, XLSX, CSV, TXT,
+  Markdown, JSON, TypeScript, JavaScript, Python, or feature files. The PDF,
+  DOCX, and XLSX parsers require the `documents` extra.
+- Use **Force re-index synchronized documents** when deliberately rebuilding
+  synchronized sources.
+
+Uploads are indexed automatically. A changed file with the same name replaces
+its earlier indexed version; use different names for distinct documents.
+Previously indexed content from other allowed source types can remain in the
+index even though the UI does not provide controls to ingest it.
+
+### 3. Generate and review tests
+
+On **Stories**, expand **Related knowledge** to inspect the passages retrieved
+for the selected story. Results from the same source appear under one heading.
+Click **Generate manual test cases**, then open **Review and publish**.
+
+Reviewers can edit titles, descriptions, preconditions, priority, category,
+references, and step tables; add or remove cases; regenerate selected cases;
+and inspect revision history. JSON is handled in the backend rather than used
+as the test-case editor.
+
+Validation checks the schema, story ID, step numbering, duplicate titles,
+references, and acceptance-criteria coverage. It does not prove that generated
+cases are semantically correct. Review the actions, expected results, test
+data, assumptions, and coverage before approval.
+
+### 4. Approve and upload
+
+Enter a **Test Plan ID** and **Test Suite ID**, or expand **Find or create a
+test plan and suite** to load available items or create them. Click **OK -
+approve and upload** to save the displayed edits, approve that revision, and
+publish the cases to the selected suite. The UI displays the resulting Azure
+IDs and status.
+
+**Approve without uploading** records approval separately. An approved set can
+also be added to project knowledge. The publisher verifies the target project,
+plan, suite, and current story revision. Local publication records and remote
+fingerprint tags help recover from partial failures; verify the final results
+in Azure, especially after a failed or repeated request.
+
+## Storage and backup
+
+The default layout is:
+
+```text
+.local/test-engineering/
+  <identity-hash>/
+    <organization-and-project-hash>/
+      knowledge.json                  document text, metadata, and sync status
+      vectors-<id>.faiss              persisted document vectors
+      knowledge-<source-hash>.faiss   scoped search index
+      knowledge-<source-hash>.manifest.json
+      workflow.json                   revisions, approvals, and publication records
+      knowledge.lock / workflow.lock  local write locks
+```
+
+`knowledge.json` is stored inside the identity and project folders, not at the
+storage root. FAISS stores vectors while the JSON sidecar supplies the text and
+metadata required to display retrieved passages. The scoped FAISS index can be
+rebuilt from the persisted vector files if the scoped index is damaged.
+
+Back up the entire project folder, including all `.faiss` and JSON files.
+These files can contain business requirements and generated tests; protect
+them with appropriate local access controls. Older vector shards are retained
+after updates and can increase disk use.
+
+Changing the embedding model or vector dimensions requires a new
+`ENGINEERING_EMBEDDING_VERSION` and a complete re-index of every relevant
+source. A partial sync can leave older sources incompatible until they are
+also re-indexed.
 
 ## Troubleshooting
 
-- **Azure connection fails:** check the organization URL, PAT validity,
-  organization policy, project access, and the API version. Do not paste the
-  PAT into logs or issue reports.
-- **No Ollama models appear:** start the local Ollama service, pull a model,
-  verify the local address and port, then click **Refresh local models**.
-- **Indexing fails with a missing Google module:** resolve the current embedding
-  setup issue above, restart Streamlit, then retry saving the story or document.
-- **Google authentication, quota, or model errors:** check the configured key,
-  account access, model availability, and provider limits. Do not assume a
-  Hugging Face token configures the Google client.
-- **Generation fails:** check the selected provider, key or local service,
-  model availability, input size, and structured-output support. Try another
-  model if the response cannot be validated.
-- **Publishing fails:** confirm plan and suite IDs, project membership, PAT
-  permissions, and the story revision. Inspect Azure for partially created
-  cases before retrying.
+| Problem | What to check |
+| --- | --- |
+| Azure connection fails | Organization URL, PAT validity, organization policy, project access, and API version. |
+| No Ollama models are listed | Start Ollama, install a model, check the local address, and click **Refresh local models**. |
+| Google embedding module is missing | Complete the embedding setup above and restart Streamlit. |
+| Embedding authentication, quota, or model error | Check the Google key, account access, model availability, and provider limits. |
+| Embedding version changed | Set the intended version label and re-index all relevant sources. |
+| Generation fails validation | Check model availability, context size, and structured-output support; retry or choose another model. |
+| Upload fails | Verify project permissions, plan and suite IDs, and story revision; inspect Azure for partial results before retrying. |
+
+## Project files
+
+| Path | Purpose |
+| --- | --- |
+| `app.py`, `src/main.py` | Streamlit entry point and environment loading. |
+| `src/ui/streamlitui/` | Connection, story, knowledge, and review interface. |
+| `src/integrations/azure_devops.py` | Azure DevOps REST integration. |
+| `src/RAG/Rag.py` | Text splitter and embedding factory. |
+| `src/test_engineering/knowledge.py` | Document ingestion, FAISS storage, and retrieval. |
+| `src/test_engineering/workflow.py` | Test generation, validation, and revision storage. |
+| `src/test_engineering/publishing.py` | Approval and Azure Test Plans publishing. |
+| `src/test_engineering/storage.py` | File locking and atomic writes. |
+| `src/LLMS/` | Groq, Ollama, structured output, and provider diagnostics. |
+| `tests/`, `examples/offline_demo.py` | Automated checks and a mocked end-to-end demonstration. |
 
 ## Verification
 
@@ -286,8 +323,9 @@ uv run python -m examples.offline_demo --output .local/demo
 uv run python -m compileall -q src tests examples scripts
 ```
 
-The tests and offline demo use mocked services or deterministic substitutes;
-they do not prove live Azure, Google, Groq, or Ollama access. Live model output
-and Azure permissions require validation in the target environment. The older
-documents under `docs/` contain historical implementation details and may refer
-to the previous embedding configuration or the now-disabled UI controls.
+The demo and automated tests use mocked services or deterministic substitutes.
+They do not verify live Azure permissions, provider credentials, or model
+quality. Validate those in the target environment before relying on generated
+test cases or publishing results. The application currently targets a trusted
+local, single-user deployment; historical files under `docs/` may describe
+earlier versions of the framework.

@@ -45,14 +45,14 @@ including authentication, are not retried as tool failures.
    then click Connect and validate access. The PAT input is masked and the form
    clears after submission. Azure URL/PAT environment values are not used for connecting.
    AZURE_DEVOPS_API_VERSION is an optional `.env` setting. Authentication and project reads are
-   validated before project selection. Optional account discovery uses Microsoft's
-   profile/account APIs; organization policy and PAT scope may deny that operation.
+   validated before project selection. Select a project within the connected organization.
 2. Select a project, team and sprint, then retrieve work items. Type names are editable
    for process templates and custom types. Search by ID/title and select a story.
    Current fields, relations, attachments and optionally discussion history are shown
    as readable details. New or changed retrieved work items are indexed automatically;
    selecting a story also saves its current revision. Repeated reads skip unchanged data.
-3. In Knowledge, sync project history or accessible Confluence Cloud pages. Uploaded
+3. In Knowledge, sync project history. Previously indexed Confluence content remains
+   available when its source is allowed, but the UI no longer offers Confluence sync. Uploaded
    documents and automation sources are indexed automatically, and changed files with
    the same name replace their earlier version. Choosing a story never re-embeds
    the entire corpus. Repeat syncs detect versions/content changes and skip unchanged
@@ -104,7 +104,7 @@ uv run python -m scripts.validate_automation_template
 
 The demo uses mocked Azure/Confluence HTTP, deterministic embeddings and a deterministic
 structured-output LLM substitute. It exercises the actual shared splitter, FAISS search,
-SQLite sync/revisions, approval gates and publisher. `.local/demo/report.json` records
+FAISS knowledge sync, JSON review revisions, approval gates and publisher. `.local/demo/report.json` records
 the result. Automation artifacts are deliberately incomplete review samples and are
 not executed. This demo does not verify live service credentials, model quality,
 application locators or an actual browser environment.
@@ -146,8 +146,8 @@ not silently certify historical requirements as current.
 This release targets a trusted local single-user deployment. Bind to loopback and
 retain Streamlit's default XSRF protection. The Azure URL and PAT are supplied through
 the session's Streamlit form. The PAT uses a password input and is passed only to
-HTTP clients, never to workflow payloads or generation prompts. Confluence tokens
-stay in HTTP clients/UI password state. Remote error bodies are discarded.
+HTTP clients, never to workflow payloads or generation prompts. Remote error bodies
+are discarded.
 No PAT is written to `.env` or workflow persistence. Disconnect closes session clients
 and clears engineering session state.
 Reconnect after restart. Provider keys use environment or session inputs without exporting user keys
@@ -156,17 +156,17 @@ to process-wide environment variables.
 Data is stored under ENGINEERING_DATA_DIR, namespaced by authenticated Azure identity
 and organization/project. Deployment-controlled ENGINEERING_ALLOWED_SOURCES restricts
 index access before vector search and restricts loading historical workflow context.
-Each permitted source set has a native `.faiss` index on disk. SQLite stores the
-source documents, metadata and numeric vectors; the index is rebuilt from them if
-its snapshot is outdated or damaged. A successful sync writes the native index,
-and future syncs embed only added or changed documents. JSON is used internally for
-storage and APIs rather than for everyday UI display or test case editing.
-Confluence full sync is partitioned by site so one site's snapshot cannot delete
-another site's content. Space-only sync is incremental; use an entire-site snapshot
-to detect deletions across spaces.
+Each permitted source set has a native `.faiss` index on disk. Individual source
+vectors are also stored in native FAISS files; `knowledge.json` stores the text,
+source metadata and sync state needed to identify them. A damaged scoped index
+can be rebuilt from its FAISS vector files. Future syncs embed only added or
+changed documents. Retrieval uses the FAISS files and JSON metadata.
+Workflow revisions and publication records are also stored in JSON. JSON is used
+internally rather than for everyday UI display or test case editing.
 
 Protect this directory with the operating system's user ACLs and encrypted storage.
-SQLite contains business documents, drafts and retrieved excerpts. Application test
+The FAISS files and JSON sidecar contain knowledge vectors and documents; the
+workflow JSON file contains drafts and retrieved excerpts. Application test
 reports can contain screenshots and application data. The knowledge index persists
 numeric vectors and documents rather than pickle files.
 
