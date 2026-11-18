@@ -12,8 +12,6 @@ wheels/
 .local/
 automation-workspaces/
 .pytest_cache/
-docs
-\docs\
 examples
 scripts
 tests
