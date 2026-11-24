@@ -39,6 +39,248 @@ class LocalEmbeddings(Embeddings):
 
 
 class ProviderTests(unittest.TestCase):
+    def test_openrouter_model_discovery_filters_structured_text_models(self):
+        from src.LLMS.openrouterllm import FREE_ROUTER, list_openrouter_models
+        def item(identifier, params, input_types=None, output_types=None):
+            return {'id': identifier, 'supported_parameters': params,
+                    'architecture': {'input_modalities': input_types or ['text'], 'output_modalities': output_types or ['text']}}
+        response = httpx.Response(200, request=httpx.Request('GET', 'https://openrouter.ai/api/v1/models'), json={'data': [
+            item('vendor/paid', ['structured_outputs']),
+            item('vendor/free:free', ['structured_outputs']),
+            item('vendor/unsupported', ['response_format']),
+            item('vendor/image-only', ['structured_outputs'], output_types=['image']),
+            item(FREE_ROUTER, ['structured_outputs']),
+        ]})
+        with patch('src.LLMS.openrouterllm.httpx.get', return_value=response) as get:
+            self.assertEqual(list_openrouter_models(), [FREE_ROUTER, 'vendor/free:free', 'vendor/paid'])
+            self.assertFalse(get.call_args.kwargs['follow_redirects'])
+
+    def test_openrouter_client_uses_scoped_credentials(self):
+        import os
+        from src.LLMS.openrouterllm import openrouter_llm, OPENROUTER_URL
+        with patch.dict(os.environ, {'OPENROUTER_API_KEY': 'environment-key', 'OPENAI_API_KEY': 'unrelated-key'}), \
+                patch('src.LLMS.openrouterllm.ChatOpenAI') as client:
+            openrouter_llm('vendor/model', 'ui-key')
+            options = client.call_args.kwargs
+            self.assertEqual(options['model'], 'vendor/model')
+            self.assertEqual(options['base_url'], OPENROUTER_URL)
+            self.assertEqual(options['api_key'].get_secret_value(), 'ui-key')
+            self.assertEqual(options['extra_body'], {'provider': {'require_parameters': True}})
+            self.assertEqual(os.environ['OPENROUTER_API_KEY'], 'environment-key')
+            openrouter_llm('vendor/model')
+            self.assertEqual(client.call_args.kwargs['api_key'].get_secret_value(), 'environment-key')
+        with patch.dict(os.environ, {'OPENROUTER_API_KEY': '', 'OPENAI_API_KEY': 'unrelated-key'}):
+            with self.assertRaisesRegex(ValueError, 'OpenRouter API key'):
+                openrouter_llm('vendor/model')
+            with self.assertRaisesRegex(ValueError, 'OpenRouter model'):
+                openrouter_llm('', 'test-key')
+
+    def test_openrouter_structured_generation_uses_json_schema(self):
+        from langchain_openai import ChatOpenAI
+        from src.LLMS.openrouterllm import openrouter_llm
+        requests = []
+        def handler(request):
+            requests.append(json.loads(request.content))
+            return httpx.Response(200, json={
+                'id': 'mock-completion', 'object': 'chat.completion', 'created': 1, 'model': 'vendor/model',
+                'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': json.dumps(draft())},
+                             'finish_reason': 'stop'}],
+                'usage': {'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2}})
+        transport = httpx.MockTransport(handler)
+        with patch('src.LLMS.openrouterllm.ChatOpenAI',
+                   side_effect=lambda **options: ChatOpenAI(**options, http_client=httpx.Client(transport=transport))):
+            result = generate_tests(openrouter_llm('vendor/model', 'test-key'), story(), [])
+        self.assertEqual(result.test_cases[0].story_id, 123)
+        self.assertEqual(requests[0]['model'], 'vendor/model')
+        self.assertEqual(requests[0]['provider'], {'require_parameters': True})
+        self.assertEqual(requests[0]['response_format']['type'], 'json_schema')
+
+    def test_openrouter_errors_do_not_expose_provider_data(self):
+        from openai import APIStatusError as OpenAIStatusError
+        request = httpx.Request('POST', 'https://openrouter.ai/api/v1/chat/completions')
+        error = OpenAIStatusError('private-model-response', response=httpx.Response(402, request=request), body=None)
+        message = provider_error_message(error)
+        self.assertIn('account credits', message)
+        self.assertNotIn('private-model-response', message)
+
+    def test_google_503_retry_is_bounded_and_does_not_retry_other_errors(self):
+        from google.genai.errors import ClientError, ServerError
+        from src.LLMS.google_retry import retry_google_unavailable
+        unavailable = ServerError(503, {'error': {'message': 'private'}})
+        attempts = []
+        def recover():
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise unavailable
+            return 'ok'
+        with patch('src.LLMS.google_retry.time.sleep') as sleep, \
+                patch('src.LLMS.google_retry.random.uniform', return_value=0):
+            self.assertEqual(retry_google_unavailable(recover), 'ok')
+            self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.5, 1.0])
+            attempts.clear()
+            with self.assertRaises(ServerError):
+                retry_google_unavailable(lambda: (attempts.append(1), (_ for _ in ()).throw(unavailable)))
+            self.assertEqual(len(attempts), 4)
+            sleep.reset_mock()
+            with self.assertRaises(ClientError):
+                retry_google_unavailable(lambda: (_ for _ in ()).throw(ClientError(429, {})))
+            sleep.assert_not_called()
+
+    def test_google_embedding_retries_wrapped_503(self):
+        from google.genai.errors import ServerError
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings
+        from langchain_google_genai._common import GoogleGenerativeAIError
+        from src.LLMS.google_embeddings import RetryingGoogleEmbeddings
+        wrapped = GoogleGenerativeAIError('private details')
+        wrapped.__cause__ = ServerError(503, {'error': {'message': 'private details'}})
+        with patch.dict('os.environ', {'GOOGLE_API_KEY': 'test-key'}), \
+                patch.object(GoogleGenerativeAIEmbeddings, 'embed_query', side_effect=[wrapped, [1.0, 2.0]]) as query, \
+                patch('src.LLMS.google_retry.time.sleep') as sleep:
+            model = RetryingGoogleEmbeddings(model='gemini-embedding-2-preview')
+            self.assertEqual(model.embed_query('sample'), [1.0, 2.0])
+            self.assertEqual(query.call_count, 2)
+            self.assertEqual(sleep.call_count, 1)
+
+    def test_gemini_structured_generation_recovers_from_503(self):
+        from google.genai.errors import ServerError
+        from langchain_core.messages import HumanMessage
+        from langchain_core.runnables import RunnableLambda
+        from src.LLMS.structured import invoke_structured
+        class FakeGemini:
+            def __init__(self): self.calls = 0
+            def with_structured_output(self, schema, **kwargs):
+                def respond(_):
+                    self.calls += 1
+                    if self.calls < 3:
+                        raise ServerError(503, {'error': {'message': 'temporary'}})
+                    return schema.model_validate(draft())
+                return RunnableLambda(respond)
+        model = FakeGemini()
+        with patch('src.LLMS.structured.ChatGoogleGenerativeAI', FakeGemini), \
+                patch('src.LLMS.google_retry.time.sleep') as sleep:
+            result = invoke_structured(model, TestDraft, [HumanMessage(content='test')])
+        self.assertEqual(result.test_cases[0].story_id, 123)
+        self.assertEqual(model.calls, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_gemini_client_uses_selected_model_and_scoped_key(self):
+        import os
+        from src.LLMS.geminillm import gemini_llm
+        from src.ui.streamlitui.test_engineering import llm_for
+        with patch.dict(os.environ, {'GOOGLE_API_KEY': 'environment-key', 'GEMINI_API_KEY': ''}), \
+                patch('src.LLMS.geminillm.ChatGoogleGenerativeAI') as client:
+            llm_for({'provider': 'Gemini', 'selected_gemini_model': 'gemini-custom', 'GEMINI_API_KEY': 'ui-key'})
+            options = client.call_args.kwargs
+            self.assertEqual(options['model'], 'gemini-custom')
+            self.assertEqual(options['api_key'].get_secret_value(), 'ui-key')
+            self.assertFalse(options['vertexai'])
+            self.assertEqual(options['max_retries'], 1)
+            self.assertEqual(os.environ['GOOGLE_API_KEY'], 'environment-key')
+            gemini_llm('gemini-custom')
+            self.assertEqual(client.call_args.kwargs['api_key'].get_secret_value(), 'environment-key')
+            self.assertNotIn('thinking_level', client.call_args.kwargs)
+            gemini_llm('gemini-3.6-flash')
+            self.assertEqual(client.call_args.kwargs['thinking_level'], 'minimal')
+            gemini_llm('gemini-3.1-pro-preview')
+            self.assertEqual(client.call_args.kwargs['thinking_level'], 'low')
+        with patch.dict(os.environ, {'GOOGLE_API_KEY': '', 'GEMINI_API_KEY': ''}):
+            with self.assertRaisesRegex(ValueError, 'Gemini API key'):
+                gemini_llm('gemini-custom')
+            with self.assertRaisesRegex(ValueError, 'Gemini model'):
+                gemini_llm('', 'key')
+
+    def test_google_provider_errors_hide_response_content(self):
+        from google.genai.errors import ClientError
+        from langchain_google_genai.chat_models import ChatGoogleGenerativeAIError
+        error = ClientError(429, {'error': {'message': 'private-prompt-and-key'}})
+        message = provider_error_message(error)
+        self.assertIn('quota or rate limit', message)
+        self.assertNotIn('private-prompt-and-key', message)
+        wrapped = ChatGoogleGenerativeAIError('private-prompt-and-key')
+        wrapped.__cause__ = error
+        self.assertEqual(provider_error_message(wrapped), message)
+
+    def test_invalid_structured_response_retries_with_schema_and_validates(self):
+        from langchain_core.exceptions import OutputParserException
+        from langchain_core.runnables import RunnableLambda
+        class Model:
+            def __init__(self):
+                self.calls = []
+            def with_structured_output(self, schema, **kwargs):
+                def respond(messages):
+                    self.calls.append(messages)
+                    if len(self.calls) == 1:
+                        raise OutputParserException('private generated content')
+                    return draft()
+                return RunnableLambda(respond)
+        model = Model()
+        result = generate_tests(model, story(), [])
+        self.assertEqual(result.test_cases[0].story_id, 123)
+        self.assertEqual(len(model.calls), 2)
+        self.assertIn('JSON schema', model.calls[1][0].content)
+        self.assertNotIn('private generated content', model.calls[1][0].content)
+
+    def test_invalid_structured_output_stops_after_one_retry_without_leaking_content(self):
+        from langchain_core.runnables import RunnableLambda
+        from src.LLMS.provider_errors import StructuredOutputError
+        class Model:
+            calls = 0
+            def with_structured_output(self, schema, **kwargs):
+                def respond(_):
+                    self.calls += 1
+                    return {'private generated content': 'invalid'}
+                return RunnableLambda(respond)
+        model = Model()
+        with self.assertRaises(StructuredOutputError) as raised:
+            generate_tests(model, story(), [])
+        self.assertEqual(model.calls, 2)
+        self.assertNotIn('private generated content', str(raised.exception))
+        self.assertIn('invalid test-case response', provider_error_message(raised.exception))
+
+    def test_ollama_invalid_response_retries_with_schema(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from src.LLMS.ollamallm import ollama_llm
+        requests = []
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def do_POST(self):
+                data = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                requests.append(data)
+                output = {'test_cases': [{}]} if len(requests) == 1 else draft()
+                result = {'model': data['model'], 'created_at': '2026-01-01T00:00:00Z',
+                          'message': {'role': 'assistant', 'content': json.dumps(output)},
+                          'done': True, 'done_reason': 'stop'}
+                content = (json.dumps(result) + '\n').encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/x-ndjson')
+                self.send_header('Content-Length', str(len(content)))
+                self.end_headers()
+                self.wfile.write(content)
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            llm = ollama_llm('local-model', f'http://127.0.0.1:{server.server_port}')
+            result = generate_tests(llm, story(), [])
+            self.assertEqual(result.test_cases[0].story_id, 123)
+            self.assertEqual(len(requests), 2)
+            self.assertIsInstance(requests[1]['format'], dict)
+            self.assertIn('JSON schema', requests[1]['messages'][0]['content'])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_google_embedding_dependency_initializes_without_network(self):
+        import os
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings
+        with patch.dict(os.environ, {'GOOGLE_API_KEY': 'test-key'}):
+            embedding = Rag().create_embeddings()
+        self.assertIsInstance(embedding, GoogleGenerativeAIEmbeddings)
+        self.assertEqual(embedding.model, 'gemini-embedding-2-preview')
+
     def test_ollama_discovery_and_local_only_connection(self):
         from src.LLMS.ollamallm import list_ollama_models, local_url, ollama_llm
         response = httpx.Response(200, json={'models': [{'name': 'z:latest'}, {'name': 'a:latest'}, {'name': 'a:latest'}]},
@@ -490,13 +732,10 @@ class KnowledgeTests(unittest.TestCase):
             self.index.sync(broken(), 'azure_devops', full_snapshot=True)
         self.assertEqual(self.index.status()[0]['status'], 'failed')
 
-    def test_optional_word_excel_pdf_parsers(self):
-        try:
-            from docx import Document as WordDocument
-            from openpyxl import Workbook
-            from pypdf import PdfWriter
-        except ImportError:
-            self.skipTest('Install the documents extra to validate optional parsers')
+    def test_word_excel_pdf_parsers(self):
+        from docx import Document as WordDocument
+        from openpyxl import Workbook
+        from pypdf import PdfWriter
         root = Path(self.temp.name)
         word = WordDocument()
         word.add_paragraph('Customer business requirements')
@@ -523,6 +762,95 @@ class ReviewTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_generation_fills_missing_criteria_in_small_batches(self):
+        from langchain_core.runnables import RunnableLambda
+        from src.test_engineering.workflow import missing_criteria
+        long_story = story()
+        long_story['fields']['Microsoft.VSTS.Common.AcceptanceCriteria'] = ''.join(
+            f'<li>Requirement {number}</li>' for number in range(1, 23))
+        missing = ['AC5', 'AC10', 'AC11', 'AC12', 'AC14', 'AC15', 'AC16', 'AC18', 'AC19', 'AC20', 'AC21', 'AC22']
+        class Model:
+            def __init__(self): self.calls = []
+            def with_structured_output(self, schema):
+                def respond(messages):
+                    self.calls.append(messages)
+                    result = draft()
+                    case = result['test_cases'][0]
+                    if len(self.calls) == 1:
+                        case['acceptance_criteria_reference'] = [f'AC{i}' for i in range(1, 23) if f'AC{i}' not in missing]
+                    else:
+                        offset = (len(self.calls) - 2) * 6
+                        case['title'] = f'Additional scenarios {len(self.calls)}'
+                        case['acceptance_criteria_reference'] = missing[offset:offset + 6]
+                    return schema.model_validate(result)
+                return RunnableLambda(respond)
+        model = Model()
+        generated = generate_tests(model, long_story, [])
+        self.assertEqual(len(model.calls), 3)
+        self.assertEqual(missing_criteria(long_story, generated), [])
+        self.assertEqual(len(generated.test_cases), 3)
+        self.assertIn('AC5', model.calls[1].to_messages()[-1].content)
+        validate_draft(generated, long_story, [])
+
+    def test_incomplete_draft_can_be_saved_but_not_approved_until_completed(self):
+        from src.test_engineering.workflow import missing_criteria
+        incomplete = draft()
+        incomplete['test_cases'][0]['acceptance_criteria_reference'] = ['AC1']
+        self.assertEqual(missing_criteria(story(), incomplete), ['AC2'])
+        with self.assertRaisesRegex(ValueError, 'Uncovered acceptance criteria: AC2'):
+            self.store.save(story(), [], incomplete)
+        identifier = self.store.save(story(), [], incomplete, allow_incomplete=True)
+        current = self.store.load(identifier)
+        with self.assertRaisesRegex(ValueError, 'Uncovered acceptance criteria: AC2'):
+            self.store.approve(identifier, current['revision'], current['digest'], explicit=True)
+        self.assertFalse(self.store.load(identifier)['approved'])
+        completed = draft()
+        self.store.save(story(), [], completed, identifier, expected_revision=1, allow_incomplete=True)
+        current = self.store.load(identifier)
+        self.store.approve(identifier, current['revision'], current['digest'], explicit=True)
+        self.assertTrue(self.store.load(identifier)['approved'])
+
+    def test_unsuccessful_coverage_repair_keeps_partial_draft_for_review(self):
+        from langchain_core.runnables import RunnableLambda
+        from src.test_engineering.workflow import missing_criteria
+        class Model:
+            calls = 0
+            def with_structured_output(self, schema):
+                def respond(_):
+                    self.calls += 1
+                    result = draft()
+                    result['test_cases'][0]['acceptance_criteria_reference'] = ['AC1']
+                    return schema.model_validate(result)
+                return RunnableLambda(respond)
+        model = Model()
+        generated = generate_tests(model, story(), [])
+        self.assertEqual(model.calls, 2)
+        self.assertEqual(len(generated.test_cases), 1)
+        self.assertEqual(missing_criteria(story(), generated), ['AC2'])
+
+    def test_google_503_during_coverage_repair_keeps_initial_cases(self):
+        from google.genai.errors import ServerError
+        from langchain_core.runnables import RunnableLambda
+        from src.test_engineering.workflow import missing_criteria
+        class FakeGemini:
+            calls = 0
+            def with_structured_output(self, schema, **kwargs):
+                def respond(_):
+                    self.calls += 1
+                    if self.calls > 1:
+                        raise ServerError(503, {'error': {'message': 'temporary'}})
+                    result = draft()
+                    result['test_cases'][0]['acceptance_criteria_reference'] = ['AC1']
+                    return schema.model_validate(result)
+                return RunnableLambda(respond)
+        model = FakeGemini()
+        with patch('src.LLMS.structured.ChatGoogleGenerativeAI', FakeGemini), \
+                patch('src.LLMS.google_retry.time.sleep'):
+            generated = generate_tests(model, story(), [])
+        self.assertEqual(model.calls, 5)
+        self.assertEqual(missing_criteria(story(), generated), ['AC2'])
+        self.assertEqual(generated.test_cases[0].title, draft()['test_cases'][0]['title'])
 
     def test_simultaneous_revision_saves_reject_a_stale_writer(self):
         from concurrent.futures import ThreadPoolExecutor
@@ -637,11 +965,57 @@ class ReviewTests(unittest.TestCase):
         returned['test_cases'][0]['description'] = 'Selected case regenerated'
         returned['test_cases'][1]['description'] = 'Unwanted model edit'
         class Model:
+            messages = None
             def with_structured_output(self, schema):
-                return RunnableLambda(lambda _: schema.model_validate(returned))
-        result = regenerate_selected(Model(), story(), [], original, [original['test_cases'][0]['title']])
+                def respond(messages):
+                    self.messages = messages
+                    return schema.model_validate(returned)
+                return RunnableLambda(respond)
+        model = Model()
+        result = regenerate_selected(model, story(), [], original, [original['test_cases'][0]['title']])
         self.assertEqual(result.test_cases[0].description, 'Selected case regenerated')
         self.assertEqual(result.test_cases[1].model_dump(), second)
+        self.assertNotIn('Preserve this scenario', model.messages.to_messages()[-1].content)
+
+    def test_generation_sends_bounded_evidence_but_keeps_story_and_criteria(self):
+        from langchain_core.runnables import RunnableLambda
+        long_story = story()
+        long_story['fields']['System.Description'] = 'full requirement ' * 300
+        context = [{'reference_id': f'ref{i}', 'content': ('relevant excerpt ' * 100),
+                    'metadata': {'title': f'Source {i}', 'private_metadata': 'do-not-send'}} for i in range(8)]
+        class Model:
+            messages = None
+            def with_structured_output(self, schema):
+                def respond(messages):
+                    self.messages = messages
+                    return schema.model_validate(draft())
+                return RunnableLambda(respond)
+        model = Model()
+        generate_tests(model, long_story, context)
+        text = model.messages.to_messages()[-1].content
+        self.assertIn('full requirement ' * 300, text)
+        self.assertIn('Name is required', text)
+        self.assertIn('ref0', text)
+        self.assertIn('ref3', text)
+        self.assertNotIn('ref4', text)
+        self.assertNotIn('do-not-send', text)
+        self.assertIn('[excerpt truncated]', text)
+        self.assertEqual(len(context), 8)
+
+    def test_regeneration_includes_uncovered_criteria(self):
+        from langchain_core.runnables import RunnableLambda
+        incomplete = draft()
+        incomplete['test_cases'][0]['acceptance_criteria_reference'] = ['AC1']
+        class Model:
+            def with_structured_output(self, schema):
+                def respond(messages):
+                    self.assert_contains_missing = '"AC2":"Save customer"' in messages.to_messages()[-1].content
+                    return schema.model_validate(draft())
+                return RunnableLambda(respond)
+        model = Model()
+        result = regenerate_selected(model, story(), [], incomplete, [incomplete['test_cases'][0]['title']])
+        self.assertTrue(model.assert_contains_missing)
+        self.assertEqual(result.test_cases[0].acceptance_criteria_reference, ['AC1', 'AC2'])
 
     def test_reduced_source_grant_blocks_saved_context(self):
         source = {'reference_id': 'a', 'metadata': {'organization_id': self.scope.organization_id,

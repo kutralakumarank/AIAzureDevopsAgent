@@ -9,6 +9,20 @@ from streamlit.testing.v1 import AppTest
 
 
 class UITests(unittest.TestCase):
+    def test_streamlit_interrupt_defers_server_shutdown(self):
+        import signal
+        from streamlit.web import bootstrap
+        server, loop = MagicMock(), MagicMock()
+        with patch.object(bootstrap.signal, 'signal') as register, \
+                patch.object(bootstrap.asyncio, 'get_running_loop', return_value=loop):
+            bootstrap._set_up_signal_handler(server)
+            handler = next(call.args[1] for call in register.call_args_list if call.args[0] == signal.SIGINT)
+            handler(signal.SIGINT, None)
+            handler(signal.SIGINT, None)
+        server.stop.assert_not_called()
+        self.assertEqual(loop.call_soon_threadsafe.call_count, 2)
+        self.assertTrue(all(call.args == (server.stop,) for call in loop.call_soon_threadsafe.call_args_list))
+
     def test_related_knowledge_groups_chunks_by_source(self):
         code = '''from src.ui.streamlitui.presentation import show_evidence
 base = {"organization_id": "org", "project_id": "project", "source_type": "files", "title": "Requirements.pdf"}
@@ -54,6 +68,33 @@ model_controls()
             app.button(key='engineering_refresh_ollama').click().run()
             self.assertFalse(app.exception)
             self.assertEqual(app.selectbox(key='engineering_ollama_model').options, ['local:latest'])
+
+    def test_gemini_provider_has_model_selector_and_masked_key(self):
+        code = 'from src.ui.streamlitui.test_engineering import model_controls\nmodel_controls()'
+        app = AppTest.from_string(code, default_timeout=60).run()
+        app.selectbox(key='engineering_llm_provider').select('Gemini').run()
+        self.assertFalse(app.exception)
+        self.assertIn('gemini-3.5-flash-lite', app.selectbox(key='engineering_gemini_model').options)
+        key_input = app.text_input(key='engineering_gemini_key')
+        self.assertEqual(key_input.proto.type, key_input.proto.PASSWORD)
+        self.assertFalse(any(item.label == 'Groq API key' for item in app.text_input))
+        app.selectbox(key='engineering_gemini_model').select('Other model').run()
+        self.assertEqual(app.text_input(key='engineering_gemini_custom_model').label, 'Gemini model ID')
+
+    def test_openrouter_provider_model_key_and_catalog_refresh(self):
+        code = 'from src.ui.streamlitui.test_engineering import model_controls\nmodel_controls()'
+        with patch('src.ui.streamlitui.test_engineering.list_openrouter_models',
+                   side_effect=[ValueError('Catalog unavailable.'), ['openrouter/free', 'vendor/model:free']]):
+            app = AppTest.from_string(code, default_timeout=60).run()
+            app.selectbox(key='engineering_llm_provider').select('OpenRouter').run()
+            self.assertFalse(app.exception)
+            self.assertIn('Catalog unavailable', app.warning[0].value)
+            key_input = app.text_input(key='engineering_openrouter_key')
+            self.assertEqual(key_input.proto.type, key_input.proto.PASSWORD)
+            app.button(key='engineering_refresh_openrouter').click().run()
+            self.assertIn('vendor/model:free', app.selectbox(key='engineering_openrouter_model').options)
+            app.selectbox(key='engineering_openrouter_model').select('Other model').run()
+            self.assertEqual(app.text_input(key='engineering_openrouter_custom_model').label, 'OpenRouter model ID')
 
     def test_app_opens_test_engineering_directly(self):
         app = AppTest.from_file('app.py', default_timeout=60).run()
@@ -118,8 +159,17 @@ model_controls()
         import httpx
         from groq import BadRequestError
         from huggingface_hub.errors import HfHubHTTPError
+        from langchain_core.exceptions import OutputParserException
+        from src.LLMS.provider_errors import StructuredOutputError
+        from google.genai.errors import ServerError
         request = httpx.Request('POST', 'https://example.invalid')
         cases = [
+            (ServerError(503, {'error': {'message': 'private-provider-data'}}), 'temporarily unavailable'),
+            (OutputParserException('private-provider-data'), 'invalid test-case response'),
+            (StructuredOutputError('private-provider-data'), 'invalid test-case response'),
+            (ModuleNotFoundError('private-path', name='langchain_google_genai'), 'Google embeddings package is missing'),
+            (ModuleNotFoundError('private-path', name='docx'), 'document parser is missing'),
+            (ModuleNotFoundError('private-path', name='unknown_dependency'), 'required Python package is missing'),
             (HfHubHTTPError('private-provider-data', response=httpx.Response(402, request=request)), 'credits and billing'),
             (BadRequestError('private-provider-data', response=httpx.Response(400, request=request),
                              body={'code': 'tool_use_failed', 'failed_generation': 'private-provider-data'}), 'structured response'),
@@ -130,6 +180,7 @@ model_controls()
                 self.assertFalse(app.exception)
                 self.assertIn(expected, app.error[0].value)
                 self.assertNotIn('private-provider-data', app.error[0].value)
+                self.assertNotIn('private-path', app.error[0].value)
 
     def test_story_and_uploaded_documents_are_added_incrementally(self):
         import faiss
@@ -259,6 +310,36 @@ model_controls()
             root = Path(directory) / sha256(b'offline-user').hexdigest()
             index = KnowledgeIndex(root, scope, Rag(embeddings=embeddings))
             self.assertTrue(index.is_current(story_document(story(), scope)))
+
+    def test_incomplete_cases_show_criteria_and_block_approval(self):
+        from test_platform import draft, story
+        from src.test_engineering.knowledge import Scope
+        from src.test_engineering.workflow import WorkflowStore
+        class Azure:
+            organization_id = 'https://dev.azure.com/offline'
+            def authorize_project(self, project): return {'id': project, 'name': 'Demo'}
+            def teams(self, project): return [{'id': 'team', 'name': 'Demo Team'}]
+            def iterations(self, project, team): return [{'id': 'sprint', 'name': 'Sprint', 'path': 'Demo\\Sprint'}]
+        scope = Scope(Azure.organization_id, 'project', frozenset({'azure_devops', 'confluence', 'files', 'approved_tests'}))
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'ENGINEERING_DATA_DIR': directory, 'ENGINEERING_ALLOWED_SOURCES': ','.join(sorted(scope.sources))}):
+            root = Path(directory) / sha256(b'offline-user').hexdigest()
+            store = WorkflowStore(root, scope)
+            incomplete = draft()
+            incomplete['test_cases'][0]['acceptance_criteria_reference'] = ['AC1']
+            identifier = store.save(story(), [], incomplete, allow_incomplete=True)
+            app = AppTest.from_string('from src.ui.streamlitui.test_engineering import render\nrender()', default_timeout=60)
+            app.session_state['engineering_azure'] = Azure()
+            app.session_state['engineering_identity'] = 'offline-user'
+            app.session_state['engineering_projects'] = [{'id': 'project', 'name': 'Demo'}]
+            app.run()
+            self.assertFalse(app.exception)
+            self.assertFalse(app.error, [error.value for error in app.error])
+            self.assertTrue(any('AC2' in warning.value for warning in app.warning))
+            app.text_input(key=f'engineering_plan_id_{scope.key}_{identifier}').set_value('12')
+            app.text_input(key=f'engineering_suite_id_{scope.key}_{identifier}').set_value('34')
+            app.run()
+            self.assertTrue(next(button for button in app.button if button.label == 'Approve without uploading').disabled)
+            self.assertTrue(next(button for button in app.button if button.label == 'OK - approve and upload').disabled)
 
     def test_one_ok_button_saves_edits_approves_and_publishes_by_ids(self):
         from test_platform import draft, story

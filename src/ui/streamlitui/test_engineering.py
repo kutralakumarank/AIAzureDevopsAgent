@@ -11,11 +11,13 @@ from pydantic import ValidationError
 
 from src.integrations.azure_devops import AzureDevOps
 from src.LLMS.groqllm import GroqLLM
+from src.LLMS.geminillm import GEMINI_MODELS, gemini_llm
 from src.LLMS.ollamallm import list_ollama_models, ollama_llm
+from src.LLMS.openrouterllm import FREE_ROUTER, list_openrouter_models, openrouter_llm
 from src.LLMS.provider_errors import provider_error_message
 from src.RAG.Rag import Rag
 from src.test_engineering.knowledge import Scope, KnowledgeIndex, story_document, file_documents
-from src.test_engineering.workflow import WorkflowStore, generate_tests, regenerate_selected, criteria_for, validate_draft
+from src.test_engineering.workflow import WorkflowStore, generate_tests, regenerate_selected, criteria_for, missing_criteria, validate_draft
 from src.test_engineering.publishing import Publisher, approve_review, approve_and_publish
 # Automation and framework evolution are disabled in the UI.
 # from src.automation.workspace import AutomationWorkspace, AutomationProposal, generate_automation, analyze_failures
@@ -34,11 +36,39 @@ def pick(label, items, key):
 
 def model_controls():
     from src.ui.uiconfigfile import Config
-    provider = st.selectbox('LLM provider', ['Groq', 'Ollama'], key='engineering_llm_provider')
+    provider = st.selectbox('LLM provider', ['Groq', 'Ollama', 'Gemini', 'OpenRouter'], key='engineering_llm_provider')
     if provider == 'Groq':
         model_name = st.selectbox('Generation model', Config().get_groq_model_options())
         key = st.text_input('Groq API key', type='password', key='engineering_groq_key')
         return {'provider': provider, 'GROQ_API_KEY': key, 'selected_groq_model': model_name}
+
+    if provider == 'Gemini':
+        selection = st.selectbox('Generation model', [*GEMINI_MODELS, 'Other model'], key='engineering_gemini_model')
+        model = st.text_input('Gemini model ID', key='engineering_gemini_custom_model') if selection == 'Other model' else selection
+        key = st.text_input('Gemini API key', type='password', key='engineering_gemini_key',
+                            help='Optional when GOOGLE_API_KEY or GEMINI_API_KEY is already configured.')
+        st.caption('The Gemini key entered here is for generation; knowledge embeddings use the configured Google credentials.')
+        st.caption('Listed Gemini models use reduced thinking to lower token usage.')
+        return {'provider': provider, 'selected_gemini_model': model, 'GEMINI_API_KEY': key}
+
+    if provider == 'OpenRouter':
+        refresh = st.button('Refresh OpenRouter models', key='engineering_refresh_openrouter')
+        cache = st.session_state.get('engineering_openrouter_models')
+        if refresh or cache is None:
+            try:
+                cache = {'models': list_openrouter_models(), 'error': None}
+            except ValueError as error:
+                cache = {'models': [FREE_ROUTER], 'error': str(error)}
+            st.session_state['engineering_openrouter_models'] = cache
+        if cache['error']:
+            st.warning(cache['error'])
+        selection = st.selectbox('Generation model', [*cache['models'], 'Other model'],
+                                 key='engineering_openrouter_model')
+        model = st.text_input('OpenRouter model ID', key='engineering_openrouter_custom_model') if selection == 'Other model' else selection
+        key = st.text_input('OpenRouter API key', type='password', key='engineering_openrouter_key',
+                            help='Optional when OPENROUTER_API_KEY is already configured.')
+        st.caption('Requests go to OpenRouter and its selected provider. Model pricing and availability vary.')
+        return {'provider': provider, 'selected_openrouter_model': model, 'OPENROUTER_API_KEY': key}
 
     base_url = os.getenv('OLLAMA_BASE_URL', 'http://127.0.0.1:11434')
     refresh = st.button('Refresh local models', key='engineering_refresh_ollama')
@@ -60,6 +90,10 @@ def model_controls():
 
 
 def llm_for(controls):
+    if controls.get('provider') == 'OpenRouter':
+        return openrouter_llm(controls.get('selected_openrouter_model'), controls.get('OPENROUTER_API_KEY', ''))
+    if controls.get('provider') == 'Gemini':
+        return gemini_llm(controls.get('selected_gemini_model'), controls.get('GEMINI_API_KEY', ''))
     if controls.get('provider') == 'Ollama':
         return ollama_llm(controls.get('selected_ollama_model'), controls['ollama_base_url'])
     llm = GroqLLM(controls).get_llm_model()
@@ -72,6 +106,12 @@ def safe_error(error):
     message = provider_error_message(error)
     if message:
         return message
+    if isinstance(error, ModuleNotFoundError):
+        if error.name == 'langchain_google_genai':
+            return 'The Google embeddings package is missing. Run `uv sync --locked --inexact` and start the app with `uv run streamlit run app.py`.'
+        if error.name in {'pypdf', 'docx', 'openpyxl'}:
+            return 'A document parser is missing. Run `uv sync --locked --inexact` and start the app with `uv run streamlit run app.py`.'
+        return 'A required Python package is missing. Run `uv sync --locked --inexact` and start the app with `uv run streamlit run app.py`.'
     if type(error) in (ValueError, PermissionError) and error.__class__.__module__ == 'builtins':
         return str(error)
     if error.__class__.__name__ == 'IntegrationError':
@@ -241,13 +281,19 @@ def _render():
                     with st.expander('Discussion history', expanded=True):
                         show_comments(comments['items'])
                 show_evidence(context)
+                st.caption('Generation uses up to four related excerpts, with up to 800 characters from each.')
                 if not saved or not retrieval_ready:
                     st.info('Save the story and restore knowledge retrieval before generating test cases.')
                 if st.button('Generate manual test cases', disabled=not (saved and retrieval_ready)):
                     with st.spinner('Generating and validating coverage…'):
                         draft = generate_tests(llm_for(controls), story, context)
-                        st.session_state['engineering_workflow'] = store.save(story, context, draft.model_dump())
-                    st.success('Draft saved. Open Review and publish.')
+                        st.session_state['engineering_workflow'] = store.save(story, context, draft.model_dump(), allow_incomplete=True)
+                    missing = missing_criteria(story, draft)
+                    if missing:
+                        st.warning('Draft saved with uncovered criteria: ' + ', '.join(missing) +
+                                   '. Open Review and publish to add or edit cases before approval.')
+                    else:
+                        st.success('Draft saved. Open Review and publish.')
     with tabs[1]:
         statuses = index.status()
         if statuses:
@@ -319,11 +365,19 @@ def _render_review(store, index, azure, project, scope, controls):
     st.caption(f"Story {workflow['story']['id']} - Revision {workflow['revision']} - {status}")
     st.write('Review and edit the generated test cases before uploading them to Azure DevOps.')
     edited = edit_draft(workflow, scope.key)
+    missing = missing_criteria(workflow['story'], edited)
+    if missing:
+        st.warning('These acceptance criteria still need test cases: ' + ', '.join(missing) +
+                   '. Add or edit cases and select the criteria they cover before approval.')
+        with st.expander('Uncovered acceptance criteria'):
+            criteria = criteria_for(workflow['story'])
+            for criteria_id in missing:
+                st.write(f'{criteria_id}: {criteria[criteria_id]}')
     if st.button('Save test case changes'):
         validate_editor_fields(edited)
-        validated = validate_draft(edited, workflow['story'], workflow['context']).model_dump()
+        validated = validate_draft(edited, workflow['story'], workflow['context'], require_complete=False).model_dump()
         if validated != workflow['draft']:
-            store.save(workflow['story'], workflow['context'], validated, identifier, expected_revision=workflow['revision'])
+            store.save(workflow['story'], workflow['context'], validated, identifier, expected_revision=workflow['revision'], allow_incomplete=True)
             st.rerun()
         st.info('There are no changes to save.')
     with st.expander('Add a test case'):
@@ -344,7 +398,7 @@ def _render_review(store, index, azure, project, scope, controls):
                         'rag_source_references': [], 'automation_feasibility': 'Medium'}
             edited['test_cases'].append(new_case)
             validate_editor_fields(edited)
-            store.save(workflow['story'], workflow['context'], edited, identifier, expected_revision=workflow['revision'])
+            store.save(workflow['story'], workflow['context'], edited, identifier, expected_revision=workflow['revision'], allow_incomplete=True)
             st.rerun()
     with st.expander('Regenerate selected test cases'):
         titles = [case['title'] for case in edited['test_cases'] if case['title']]
@@ -352,15 +406,15 @@ def _render_review(store, index, azure, project, scope, controls):
         instruction = st.text_input('Instructions for regeneration', key=f'regenerate_instruction_{identifier}_{workflow["revision"]}')
         if st.button('Regenerate selected cases'):
             validate_editor_fields(edited)
-            validate_draft(edited, workflow['story'], workflow['context'])
+            validate_draft(edited, workflow['story'], workflow['context'], require_complete=False)
             draft = regenerate_selected(llm_for(controls), workflow['story'], workflow['context'], edited,
                                         selected_titles, instruction)
-            store.save(workflow['story'], workflow['context'], draft.model_dump(), identifier, expected_revision=workflow['revision'])
+            store.save(workflow['story'], workflow['context'], draft.model_dump(), identifier, expected_revision=workflow['revision'], allow_incomplete=True)
             st.rerun()
     with st.expander('Revision history'):
         st.dataframe([{'Revision': item['revision'], 'Status': 'Approved' if item['approved'] else 'Needs review',
                        'Saved at': item['created_at']} for item in store.history(identifier)], hide_index=True, width='stretch')
-    if st.button('Approve without uploading'):
+    if st.button('Approve without uploading', disabled=bool(missing)):
         validate_editor_fields(edited)
         approve_review(store, identifier, workflow['revision'], workflow['digest'], edited, explicit=True)
         st.rerun()
@@ -406,7 +460,7 @@ def _render_review(store, index, azure, project, scope, controls):
     ids = [plan_id.strip(), suite_id.strip()]
     ready = all(value.isascii() and value.isdigit() and 1 <= int(value) <= 2147483647 for value in ids)
     st.caption('Clicking OK approves the displayed cases and uploads them to the entered plan and suite.')
-    if st.button('OK - approve and upload', type='primary', disabled=not ready):
+    if st.button('OK - approve and upload', type='primary', disabled=not ready or bool(missing)):
         validate_editor_fields(edited)
         results = approve_and_publish(Publisher(azure, store, project['id']), identifier,
                                       workflow['revision'], workflow['digest'], edited,
